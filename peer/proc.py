@@ -97,8 +97,8 @@ class ProcNode:
                 logger.warning(f"Poll error: {e}")
             time.sleep(self.poll_interval)
 
-    def do_distributed_train_task(self, data):
-        """PROC: Distributed training across multiple PROC nodes"""
+    def do_federated_train_task(self, data):
+        """PROC: Training task received via polling from coordinator"""
         
         job_id = data.get("job_id")
         round_num = data.get("round", 1)
@@ -109,19 +109,13 @@ class ProcNode:
         batch_size = data.get("batch_size", 32)
         is_first_round = data.get("is_first_round", True)
         
-        # Distributed training parameters
-        node_rank = data.get("node_rank", 0)  # This node's rank
-        total_nodes = data.get("total_nodes", 1)  # Total PROC nodes participating
-        aggregation_strategy = data.get("aggregation_strategy", "fedavg")
-        
         self.participant.current_job_id = job_id
         self.participant.current_round = round_num
         self.training_active = True
         
-        logger.info(f"PROC: Starting distributed training for job {job_id}, round {round_num}")
-        logger.info(f"  Node rank: {node_rank}/{total_nodes}")
+        logger.info(f"PROC: Starting training for job {job_id}, round {round_num}")
         logger.info(f"  Model: {model_name}, Epochs: {epochs}, LR: {learning_rate}")
-        logger.info(f"  Aggregation: {aggregation_strategy}")
+        logger.info(f"  Batches assigned: {len(batches)}")
         
         try:
             # Initialize or load model
@@ -134,7 +128,6 @@ class ProcNode:
             else:
                 # Load global weights from previous round
                 logger.info("  Loading global weights from coordinator")
-                # Would load from coordinator - for now use existing model
                 if self.local_model is None:
                     self.local_model = AutoModelForSequenceClassification.from_pretrained(
                         model_name, num_labels=2
@@ -146,25 +139,17 @@ class ProcNode:
             optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
             criterion = nn.CrossEntropyLoss()
             
-            # Collect batches assigned to this node
+            # Collect all assigned batches
             all_sequences = []
             all_masks = []
             all_labels = []
             incorporated_batches = set()
             
-            # Filter batches for this node based on rank
-            assigned_batches = []
-            for idx, batch_info in enumerate(batches):
-                if idx % total_nodes == node_rank:
-                    assigned_batches.append(batch_info)
-            
-            logger.info(f"  Assigned {len(assigned_batches)} batches out of {len(batches)} total")
-            
-            # Request and collect assigned batches
+            # Request and collect batches from PREP nodes
             if hasattr(self.participant, 'batch_sources') and job_id in self.participant.batch_sources:
                 batch_sources = self.participant.batch_sources[job_id]
                 
-                for batch_info in assigned_batches:
+                for batch_info in batches:
                     batch_num = batch_info.get('batch_number', 0)
                     batch_key = f"{job_id}_batch_{batch_num}"
                     
@@ -184,16 +169,11 @@ class ProcNode:
                                 self.participant.local_batches[batch_key] = batch_data
                                 logger.info(f"Received batch {batch_num}")
             
-            # Collect local batches for this node
+            # Collect local batches
             local_batches = getattr(self.participant, 'local_batches', {})
             for batch_key, batch_data in local_batches.items():
                 if batch_key.startswith(f"{job_id}_batch_") and batch_key not in incorporated_batches:
                     batch_num = int(batch_key.split('_')[-1])
-                    # Check if this batch belongs to this node
-                    batch_idx = int(batch_num)
-                    if batch_idx % total_nodes != node_rank:
-                        continue
-                    
                     incorporated_batches.add(batch_key)
                     if "embeddings" in batch_data:
                         all_sequences.extend(batch_data["embeddings"])
@@ -204,7 +184,7 @@ class ProcNode:
                     logger.info(f"Added batch {batch_num} to training data")
             
             if not all_sequences:
-                logger.warning("No batches available for this node, waiting...")
+                logger.warning("No batches available, waiting...")
                 wait_count = 0
                 while not all_sequences and self.training_active and wait_count < 60:
                     time.sleep(1)
@@ -212,9 +192,6 @@ class ProcNode:
                     local_batches = getattr(self.participant, 'local_batches', {})
                     for batch_key, batch_data in local_batches.items():
                         if batch_key.startswith(f"{job_id}_batch_") and batch_key not in incorporated_batches:
-                            batch_num = int(batch_key.split('_')[-1])
-                            if batch_num % total_nodes != node_rank:
-                                continue
                             incorporated_batches.add(batch_key)
                             if "embeddings" in batch_data:
                                 all_sequences.extend(batch_data["embeddings"])
@@ -222,7 +199,7 @@ class ProcNode:
                                 all_sequences.extend(batch_data["input_ids"])
                             all_masks.extend(batch_data["attention_mask"])
                             all_labels.extend([0] * len(batch_data.get("embeddings", batch_data.get("input_ids", []))))
-                            logger.info(f"Added batch {batch_num} after waiting")
+                            logger.info(f"Added batch after waiting")
                             break
             
             if not all_sequences:
@@ -288,7 +265,7 @@ class ProcNode:
             weights = self._extract_model_weights(model)
             
             # Send weights to coordinator for aggregation
-            self.participant._send_model_update(job_id, round_num, weights, avg_loss, node_rank=node_rank)
+            self.participant._send_model_update(job_id, round_num, weights, avg_loss)
             
         except Exception as e:
             logger.error(f"PROC training error: {e}")
