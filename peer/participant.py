@@ -618,6 +618,22 @@ class Participant:
             except Exception as e:
                 logger.warning(f"WS batch progress failed: {e}")
 
+    def _send_model_update(self, job_id, round_num, weights, loss):
+        """Send trained model weights to coordinator for aggregation"""
+        if self.ws and self.connected:
+            try:
+                self.ws.send(json.dumps({
+                    "type": "model_update",
+                    "from": self.name,
+                    "job_id": job_id,
+                    "round": round_num,
+                    "weights": weights,
+                    "loss": loss
+                }))
+                logger.info(f"Sent model update for job {job_id}, round {round_num}")
+            except Exception as e:
+                logger.warning(f"WS model update failed: {e}")
+
     def poll_tasks(self):
         while self.running:
             time.sleep(10)
