@@ -479,6 +479,12 @@ class Participant:
                 elif self.role == "PROC" and self.proc_node:
                     self.proc_node.handle_task_assigned({"id": task_id, "data": task_data})
 
+            elif msg_type == "task_train":
+                logger.info(f"PROC task: received federated training task via WebSocket")
+                # Queue the training task for processing
+                task_id = str(uuid.uuid4())
+                self.task_queue.put({"task_id": task_id, "type": "task_train", "data": data})
+
             elif msg_type == "send_batch":
                 # Handle batch request from PROC node
                 job_id = data.get("job_id")
