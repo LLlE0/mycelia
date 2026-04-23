@@ -483,7 +483,11 @@ class Participant:
                 # Queue the training task for processing
                 task_id = str(uuid.uuid4())
                 # Extract task data from the message (remove 'type' field)
+                # job_id might be at top level or inside 'data' field
                 task_data = {k: v for k, v in data.items() if k != 'type'}
+                # Ensure job_id is in task_data (it might be at top level of the message)
+                if "job_id" not in task_data and "job_id" in data:
+                    task_data["job_id"] = data["job_id"]
                 self.task_queue.put({"task_id": task_id, "type": "task_train", "data": task_data})
 
             elif msg_type == "send_batch":
