@@ -1700,12 +1700,11 @@ func (s *Server) handleBatchProgress(c *gin.Context) {
 	}
 
 	// Check if all batches are ready
-	total, ready, _ := s.db.GetBatchStats(batch.JobID)
+	_, ready, _ := s.db.GetBatchStats(batch.JobID)
 	job, _ := s.db.GetTrainingJobByID(batch.JobID)
 	log.Printf("handleBatchProgress: job=%s, total_batches=%d, ready_batches=%d, status=%s", 
 		batch.JobID, job.TotalBatches, ready, job.Status)
 	if job != nil && ready >= job.TotalBatches && job.Status == "preprocessing" {
-		// All batches ready - start training
 		log.Printf("=== ALL BATCHES READY: %d/%d, starting training ===", ready, job.TotalBatches)
 		s.startTrainingRound(batch.JobID)
 	} else if job != nil {
