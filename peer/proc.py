@@ -43,7 +43,7 @@ class ProcNode:
     def _process_task(self, task_id, task_data):
         try:
             logger.info(f"Processing PROC task {task_id}")
-            self.do_distributed_train_task(task_data)
+            self.do_federated_train_task(task_data)
             self._report_task_completed(task_id)
         except Exception as e:
             logger.error(f"PROC task {task_id} failed: {e}")
@@ -175,12 +175,10 @@ class ProcNode:
                 if batch_key.startswith(f"{job_id}_batch_") and batch_key not in incorporated_batches:
                     batch_num = int(batch_key.split('_')[-1])
                     incorporated_batches.add(batch_key)
-                    if "embeddings" in batch_data:
-                        all_sequences.extend(batch_data["embeddings"])
-                    else:
-                        all_sequences.extend(batch_data["input_ids"])
+                    # Use input_ids for BERT training (not embeddings)
+                    all_sequences.extend(batch_data["input_ids"])
                     all_masks.extend(batch_data["attention_mask"])
-                    all_labels.extend([0] * len(batch_data.get("embeddings", batch_data.get("input_ids", []))))
+                    all_labels.extend([0] * len(batch_data.get("input_ids", [])))
                     logger.info(f"Added batch {batch_num} to training data")
             
             if not all_sequences:
@@ -193,12 +191,9 @@ class ProcNode:
                     for batch_key, batch_data in local_batches.items():
                         if batch_key.startswith(f"{job_id}_batch_") and batch_key not in incorporated_batches:
                             incorporated_batches.add(batch_key)
-                            if "embeddings" in batch_data:
-                                all_sequences.extend(batch_data["embeddings"])
-                            else:
-                                all_sequences.extend(batch_data["input_ids"])
+                            all_sequences.extend(batch_data["input_ids"])
                             all_masks.extend(batch_data["attention_mask"])
-                            all_labels.extend([0] * len(batch_data.get("embeddings", batch_data.get("input_ids", []))))
+                            all_labels.extend([0] * len(batch_data.get("input_ids", [])))
                             logger.info(f"Added batch after waiting")
                             break
             
@@ -206,19 +201,24 @@ class ProcNode:
                 logger.error("No data available for training")
                 return
             
-            # Prepare dataset
-            max_len = max(len(seq) for seq in all_sequences)
+            # Prepare dataset - pad sequences to model's expected max_length (512 for BERT)
+            # The error occurs when sequence length doesn't match model's embedding size
+            # We need to ensure consistent padding to 512 tokens
+            model_max_length = 512  # BERT default max_length
             padded_sequences = []
             padded_masks = []
             for seq, mask in zip(all_sequences, all_masks):
-                if len(seq) < max_len:
-                    seq = seq + [0] * (max_len - len(seq))
-                    mask = mask + [0] * (max_len - len(mask))
-                padded_sequences.append(seq[:max_len])
-                padded_masks.append(mask[:max_len])
+                if len(seq) < model_max_length:
+                    seq = seq + [0] * (model_max_length - len(seq))
+                    mask = mask + [0] * (model_max_length - len(mask))
+                else:
+                    seq = seq[:model_max_length]
+                    mask = mask[:model_max_length]
+                padded_sequences.append(seq)
+                padded_masks.append(mask)
             
-            # Limit samples for efficiency
-            num_samples = min(len(padded_sequences), batch_size * 10)
+            # Limit samples for efficiency - increased from 10 to 100 batches
+            num_samples = min(len(padded_sequences), batch_size * 100)
             input_ids = torch.tensor(padded_sequences[:num_samples], dtype=torch.long)
             attention_mask = torch.tensor(padded_masks[:num_samples], dtype=torch.long)
             labels = torch.tensor(all_labels[:num_samples], dtype=torch.long)
