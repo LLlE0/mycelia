@@ -473,11 +473,10 @@ class Participant:
                 logger.info(f"{self.role} task: received assigned task")
                 task_id = data.get("id")
                 task_data = data.get("data")
-                # Start task for role
+                # Start task for PREP role only (PROC uses task_train via WebSocket)
                 if self.role == "PREP" and self.prep_node:
                     self.prep_node.handle_task_assigned({"id": task_id, "data": task_data})
-                elif self.role == "PROC" and self.proc_node:
-                    self.proc_node.handle_task_assigned({"id": task_id, "data": task_data})
+                # PROC tasks are handled via task_train message type
 
             elif msg_type == "task_train":
                 logger.info(f"PROC task: received federated training task via WebSocket")
@@ -520,6 +519,9 @@ class Participant:
                     self.batch_sources = {}
                 self.batch_sources[job_id] = batch_sources
                 logger.info(f"Received batch sources for job {job_id}: {len(batch_sources)} batches")
+                # Forward to proc_node for handling
+                if self.role == "PROC" and self.proc_node:
+                    self.proc_node.handle_batch_sources(data)
 
             elif msg_type == "batch_data":
                 # Receive batch data from PREP node
@@ -534,6 +536,9 @@ class Participant:
                 if not hasattr(self, 'local_batches'):
                     self.local_batches = {}
                 self.local_batches[batch_key] = batch_data
+                # Forward to proc_node for handling
+                if self.role == "PROC" and self.proc_node:
+                    self.proc_node.handle_batch_data(data)
 
             elif msg_type == "training_stop":
                 job_id = data.get("job_id")
