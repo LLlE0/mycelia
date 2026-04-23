@@ -126,7 +126,6 @@ class ProcNode:
                     num_labels=2
                 )
             else:
-                # Load global weights from previous round
                 logger.info("  Loading global weights from coordinator")
                 if self.local_model is None:
                     self.local_model = AutoModelForSequenceClassification.from_pretrained(
@@ -139,107 +138,161 @@ class ProcNode:
             optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
             criterion = nn.CrossEntropyLoss()
             
-            # Collect all assigned batches
-            all_sequences = []
-            all_masks = []
-            all_labels = []
-            incorporated_batches = set()
-            
-            # Request and collect batches from PREP nodes
+            # Wait for batch sources to be available
             if not hasattr(self.participant, 'batch_sources') or job_id not in self.participant.batch_sources:
-                logger.warning(f"No batch sources available for job {job_id}, waiting...")
+                logger.info(f"Waiting for batch sources for job {job_id}...")
                 wait_count = 0
-                while (not hasattr(self.participant, 'batch_sources') or job_id not in self.participant.batch_sources) and wait_count < 30:
+                while (not hasattr(self.participant, 'batch_sources') or job_id not in self.participant.batch_sources) and wait_count < 60:
                     time.sleep(1)
                     wait_count += 1
             
-            if hasattr(self.participant, 'batch_sources') and job_id in self.participant.batch_sources:
-                batch_sources = self.participant.batch_sources[job_id]
-                logger.info(f"Found batch sources for job {job_id}: {len(batch_sources)} mappings")
-                
-                for batch_info in batches:
-                    batch_num = batch_info.get('batch_number', 0)
-                    batch_key = f"{job_id}_batch_{batch_num}"
-                    
-                    if batch_key not in getattr(self.participant, 'local_batches', {}):
-                        if str(batch_num) in batch_sources:
-                            prep_info = batch_sources[str(batch_num)]
-                            prep_name = prep_info.get('name', '')
-                            prep_ip = prep_info.get('ip', '')
-                            prep_port = prep_info.get('port', 11130)
-                            
-                            logger.info(f"Requesting batch {batch_num} from {prep_name} ({prep_ip}:{prep_port})")
-                            from network import request_batch_direct
-                            batch_data = request_batch_direct(prep_ip, prep_port, job_id, batch_num, timeout=15)
-                            
-                            if batch_data:
-                                if not hasattr(self.participant, 'local_batches'):
-                                    self.participant.local_batches = {}
-                                self.participant.local_batches[batch_key] = batch_data
-                                logger.info(f"Received batch {batch_num} successfully")
-                        else:
-                            logger.warning(f"Batch {batch_num} not found in batch_sources")
-            else:
-                logger.error(f"Still no batch sources for job {job_id} after waiting")
-            
-            # Collect local batches
-            local_batches = getattr(self.participant, 'local_batches', {})
-            for batch_key, batch_data in local_batches.items():
-                if batch_key.startswith(f"{job_id}_batch_") and batch_key not in incorporated_batches:
-                    batch_num = int(batch_key.split('_')[-1])
-                    incorporated_batches.add(batch_key)
-                    # Use input_ids for BERT training (not embeddings)
-                    all_sequences.extend(batch_data["input_ids"])
-                    all_masks.extend(batch_data["attention_mask"])
-                    all_labels.extend([0] * len(batch_data.get("input_ids", [])))
-                    logger.info(f"Added batch {batch_num} to training data")
-            
-            if not all_sequences:
-                logger.warning("No batches available, waiting...")
-                wait_count = 0
-                while not all_sequences and self.training_active and wait_count < 60:
-                    time.sleep(1)
-                    wait_count += 1
-                    local_batches = getattr(self.participant, 'local_batches', {})
-                    for batch_key, batch_data in local_batches.items():
-                        if batch_key.startswith(f"{job_id}_batch_") and batch_key not in incorporated_batches:
-                            incorporated_batches.add(batch_key)
-                            all_sequences.extend(batch_data["input_ids"])
-                            all_masks.extend(batch_data["attention_mask"])
-                            all_labels.extend([0] * len(batch_data.get("input_ids", [])))
-                            logger.info(f"Added batch after waiting")
-                            break
-            
-            if not all_sequences:
-                logger.error("No data available for training")
+            if not hasattr(self.participant, 'batch_sources') or job_id not in self.participant.batch_sources:
+                logger.error(f"No batch sources available for job {job_id} after waiting")
                 return
+
+            batch_sources = self.participant.batch_sources[job_id]
+            logger.info(f"Found batch sources for job {job_id}: {len(batch_sources)} mappings")
             
-            # Prepare dataset - pad sequences to model's expected max_length (512 for BERT)
-            # The error occurs when sequence length doesn't match model's embedding size
-            # We need to ensure consistent padding to 512 tokens
-            model_max_length = 512  # BERT default max_length
-            padded_sequences = []
-            padded_masks = []
-            for seq, mask in zip(all_sequences, all_masks):
-                if len(seq) < model_max_length:
-                    seq = seq + [0] * (model_max_length - len(seq))
-                    mask = mask + [0] * (model_max_length - len(mask))
+            # Ensure all required batches are downloaded before training
+            # Store only metadata, not full data in memory
+            batch_metadata = []
+            
+            for batch_info in batches:
+                batch_num = batch_info.get('batch_number', 0)
+                batch_key = f"{job_id}_batch_{batch_num}"
+                
+                # Check if already downloaded
+                if batch_key not in getattr(self.participant, 'local_batches', {}):
+                    if str(batch_num) in batch_sources:
+                        prep_info = batch_sources[str(batch_num)]
+                        prep_name = prep_info.get('name', '')
+                        prep_ip = prep_info.get('ip', '')
+                        prep_port = prep_info.get('port', 11130)
+                        
+                        logger.info(f"Requesting batch {batch_num} from {prep_name} ({prep_ip}:{prep_port})")
+                        from network import request_batch_direct
+                        batch_data = request_batch_direct(prep_ip, prep_port, job_id, batch_num, timeout=30)
+                        
+                        if batch_data:
+                            if not hasattr(self.participant, 'local_batches'):
+                                self.participant.local_batches = {}
+                            self.participant.local_batches[batch_key] = batch_data
+                            logger.info(f"Received batch {batch_num} successfully")
+                        else:
+                            logger.error(f"Failed to download batch {batch_num}")
+                    else:
+                        logger.warning(f"Batch {batch_num} not found in batch_sources")
                 else:
-                    seq = seq[:model_max_length]
-                    mask = mask[:model_max_length]
-                padded_sequences.append(seq)
-                padded_masks.append(mask)
+                    logger.debug(f"Batch {batch_num} already in memory")
+                
+                batch_metadata.append(batch_num)
+
+            # Verify we have data
+            local_batches = getattr(self.participant, 'local_batches', {})
+            available_count = sum(1 for bn in batch_metadata if f"{job_id}_batch_{bn}" in local_batches)
             
-            # Limit samples for efficiency - increased from 10 to 100 batches
-            num_samples = min(len(padded_sequences), batch_size * 100)
-            input_ids = torch.tensor(padded_sequences[:num_samples], dtype=torch.long)
-            attention_mask = torch.tensor(padded_masks[:num_samples], dtype=torch.long)
-            labels = torch.tensor(all_labels[:num_samples], dtype=torch.long)
+            if available_count == 0:
+                logger.error("No data available for training after downloading")
+                return
+
+            logger.info(f"Starting training with {available_count} batches loaded")
             
-            dataset = TensorDataset(input_ids, attention_mask, labels)
-            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            # Helper function to get a single batch tensor
+            def get_batch_tensor(batch_num):
+                batch_key = f"{job_id}_batch_{batch_num}"
+                if batch_key not in local_batches:
+                    return None
+                
+                batch_data = local_batches[batch_key]
+                input_ids = batch_data.get("input_ids", [])
+                attention_mask = batch_data.get("attention_mask", [])
+                
+                if not input_ids:
+                    return None
+                
+                # Pad to max length
+                model_max_length = 512
+                padded_seqs = []
+                padded_masks = []
+                
+                for seq, mask in zip(input_ids, attention_mask):
+                    if len(seq) < model_max_length:
+                        seq = seq + [0] * (model_max_length - len(seq))
+                        mask = mask + [0] * (model_max_length - len(mask))
+                    else:
+                        seq = seq[:model_max_length]
+                        mask = mask[:model_max_length]
+                    padded_seqs.append(seq)
+                    padded_masks.append(mask)
+                
+                ids_tensor = torch.tensor(padded_seqs, dtype=torch.long)
+                mask_tensor = torch.tensor(padded_masks, dtype=torch.long)
+                # Labels are assumed 0 for this example, adjust if needed
+                labels_tensor = torch.zeros(len(ids_tensor), dtype=torch.long)
+                
+                return ids_tensor, mask_tensor, labels_tensor
+
+            # Create a custom dataset that loads batches on demand to save memory
+            class StreamingDataset(torch.utils.data.Dataset):
+                def __init__(self, batch_nums, get_batch_fn):
+                    self.batch_nums = batch_nums
+                    self.get_batch_fn = get_batch_fn
+                    self._cache = {} # Cache individual samples if needed, but better to cache whole batches
+                    
+                    # Pre-load all batches into a single large tensor structure? 
+                    # No, that causes OOM. Instead, we keep them separate and index logically.
+                    # Actually, for simplicity and speed with small number of batches (32), 
+                    # we can concatenate them once here IF they fit. 
+                    # But since we just OOMed, let's try to be smarter.
+                    # We will just store the list of tensors and index into them.
+                    
+                    self.all_ids = []
+                    self.all_masks = []
+                    self.all_labels = []
+                    
+                    logger.info("Concatenating batches for dataset...")
+                    for bn in self.batch_nums:
+                        res = self.get_batch_fn(bn)
+                        if res:
+                            ids, masks, labels = res
+                            self.all_ids.append(ids)
+                            self.all_masks.append(masks)
+                            self.all_labels.append(labels)
+                    
+                    if self.all_ids:
+                        self.total_len = sum(t.shape[0] for t in self.all_ids)
+                        logger.info(f"Total samples in dataset: {self.total_len}")
+                    else:
+                        self.total_len = 0
+
+                def __len__(self):
+                    return self.total_len
+
+                def __getitem__(self, idx):
+                    # Find which batch this index belongs to
+                    current_idx = 0
+                    for i, ids_tensor in enumerate(self.all_ids):
+                        batch_len = ids_tensor.shape[0]
+                        if idx < current_idx + batch_len:
+                            local_idx = idx - current_idx
+                            return (
+                                self.all_ids[i][local_idx],
+                                self.all_masks[i][local_idx],
+                                self.all_labels[i][local_idx]
+                            )
+                        current_idx += batch_len
+                    raise IndexError("Index out of range")
+
+            # Build dataset
+            dataset = StreamingDataset(batch_metadata, get_batch_tensor)
             
-            logger.info(f"Starting training with {len(dataset)} samples, {len(dataloader)} batches")
+            if len(dataset) == 0:
+                logger.error("Dataset is empty")
+                return
+
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+            
+            logger.info(f"Starting training loop: {len(dataloader)} steps per epoch")
             
             # Training loop
             total_loss = 0
@@ -248,9 +301,18 @@ class ProcNode:
                     break
                     
                 epoch_loss = 0
+                step_count = 0
+                
                 for batch in dataloader:
                     batch_input_ids, batch_attention, batch_labels = batch
                     
+                    # Move to GPU if available
+                    if torch.cuda.is_available():
+                        batch_input_ids = batch_input_ids.to('cuda')
+                        batch_attention = batch_attention.to('cuda')
+                        batch_labels = batch_labels.to('cuda')
+                        model.to('cuda')
+
                     optimizer.zero_grad()
                     outputs = model(
                         input_ids=batch_input_ids,
@@ -262,10 +324,18 @@ class ProcNode:
                     optimizer.step()
                     
                     epoch_loss += loss.item()
+                    step_count += 1
+                    
+                    # Optional: Log progress every 10 steps
+                    if step_count % 10 == 0:
+                        logger.debug(f"Epoch {epoch+1}, Step {step_count}, Loss: {loss.item():.4f}")
                 
-                avg_loss = epoch_loss / len(dataloader)
-                total_loss += avg_loss
-                logger.info(f"  Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f}")
+                if step_count > 0:
+                    avg_loss = epoch_loss / step_count
+                    total_loss += avg_loss
+                    logger.info(f"  Epoch {epoch+1}/{epochs} completed - Loss: {avg_loss:.4f}")
+                else:
+                    logger.warning(f"  Epoch {epoch+1} had no steps")
             
             if epochs > 0:
                 avg_loss = total_loss / epochs
@@ -280,10 +350,18 @@ class ProcNode:
             # Send weights to coordinator for aggregation
             self.participant._send_model_update(job_id, round_num, weights, avg_loss)
             
+            # Optional: Clear memory after training
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # Optionally clear local batches if no longer needed immediately
+            # self.participant.local_batches = {} 
+            
         except Exception as e:
             logger.error(f"PROC training error: {e}")
             import traceback
             traceback.print_exc()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _extract_model_weights(self, model):
         """Extract model weights as dictionary"""
