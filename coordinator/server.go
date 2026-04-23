@@ -633,6 +633,7 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 			// Handle task completion from PREP/PROC nodes
 			taskID, _ := msgData["task_id"].(string)
 			from, _ := msgData["from"].(string)
+			jobID, _ := msgData["job_id"].(string)
 
 			log.Printf("Task %s completed by %s", taskID, from)
 
@@ -640,6 +641,24 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 			err := s.db.UpdatePreprocessingTaskByTaskID(taskID, bson.M{"status": "completed"})
 			if err != nil {
 				log.Printf("Failed to update preprocessing task %s: %v", taskID, err)
+			}
+
+			// If this is a PREP node task completion, check if all batches are ready
+			if jobID != "" {
+				job, err := s.db.GetTrainingJobByID(jobID)
+				if err == nil && job != nil && job.Status == "preprocessing" {
+					ready := 0
+					batches, _ := s.db.GetBatchesByJob(jobID)
+					for _, b := range batches {
+						if b.Status == "ready" || b.Status == "training" {
+							ready++
+						}
+					}
+					if ready >= job.TotalBatches {
+						log.Printf("All %d batches ready (%.1f%%), starting training round for job %s (triggered by task_completed)", ready, float64(ready)/float64(job.TotalBatches)*100, jobID)
+						s.startTrainingRound(jobID)
+					}
+				}
 			}
 
 		} else if msgType == "task_error" {
