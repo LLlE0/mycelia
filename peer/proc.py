@@ -283,79 +283,97 @@ class ProcNode:
                         current_idx += batch_len
                     raise IndexError("Index out of range")
 
-            # Build dataset
-            dataset = StreamingDataset(batch_metadata, get_batch_tensor)
-            
-            if len(dataset) == 0:
-                logger.error("Dataset is empty")
+            if not all_sequences:
+                logger.error("No data available for training")
                 return
+            
+            # --- ИСПРАВЛЕНИЕ: Создаем датасет БЕЗ гигантских тензоров в памяти сразу ---
+            # Храним данные как обычные списки Python, тензоры создаются только при запросе элемента
+            
+            class FederatedDataset(torch.utils.data.Dataset):
+                def __init__(self, sequences, masks, labels):
+                    self.sequences = sequences  # Список списков
+                    self.masks = masks          # Список списков
+                    self.labels = labels        # Список чисел
 
-            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+                def __len__(self):
+                    return len(self.sequences)
+
+                def __getitem__(self, idx):
+                    # Создаем тензоры только для одного элемента
+                    return {
+                        'input_ids': torch.tensor(self.sequences[idx], dtype=torch.long),
+                        'attention_mask': torch.tensor(self.masks[idx], dtype=torch.long),
+                        'labels': torch.tensor(self.labels[idx], dtype=torch.long)
+                    }
+
+            dataset = FederatedDataset(all_sequences, all_masks, all_labels)
             
-            logger.info(f"Starting training loop: {len(dataloader)} steps per epoch")
+            # Уменьшаем размер батча для экономии памяти
+            effective_batch_size = min(batch_size, 16) 
+            dataloader = DataLoader(dataset, batch_size=effective_batch_size, shuffle=True, num_workers=0)
+
+            logger.info(f"Starting training loop: {len(dataloader)} steps per epoch, batch_size={effective_batch_size}")
             
-            # Training loop
+            # Освобождаем память перед обучением
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                model = model.cuda()
+
+            model.train()
             total_loss = 0
+            steps_count = 0
+
             for epoch in range(epochs):
                 if not self.training_active:
                     break
-                    
-                epoch_loss = 0
-                step_count = 0
                 
-                for batch in dataloader:
-                    batch_input_ids, batch_attention, batch_labels = batch
-                    
-                    # Move to GPU if available
-                    if torch.cuda.is_available():
-                        batch_input_ids = batch_input_ids.to('cuda')
-                        batch_attention = batch_attention.to('cuda')
-                        batch_labels = batch_labels.to('cuda')
-                        model.to('cuda')
+                epoch_loss = 0
+                steps_count = 0
+                
+                for batch_idx, batch in enumerate(dataloader):
+                    if not self.training_active:
+                        break
+
+                    input_ids = batch['input_ids'].to('cuda' if torch.cuda.is_available() else 'cpu')
+                    attention_mask = batch['attention_mask'].to('cuda' if torch.cuda.is_available() else 'cpu')
+                    labels = batch['labels'].to('cuda' if torch.cuda.is_available() else 'cpu')
 
                     optimizer.zero_grad()
+                    
                     outputs = model(
-                        input_ids=batch_input_ids,
-                        attention_mask=batch_attention,
-                        labels=batch_labels
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
                     )
+                    
                     loss = outputs.loss
                     loss.backward()
                     optimizer.step()
-                    
+
                     epoch_loss += loss.item()
-                    step_count += 1
+                    steps_count += 1
                     
-                    # Optional: Log progress every 10 steps
-                    if step_count % 10 == 0:
-                        logger.debug(f"Epoch {epoch+1}, Step {step_count}, Loss: {loss.item():.4f}")
-                
-                if step_count > 0:
-                    avg_loss = epoch_loss / step_count
-                    total_loss += avg_loss
-                    logger.info(f"  Epoch {epoch+1}/{epochs} completed - Loss: {avg_loss:.4f}")
-                else:
-                    logger.warning(f"  Epoch {epoch+1} had no steps")
-            
-            if epochs > 0:
-                avg_loss = total_loss / epochs
-            else:
-                avg_loss = 0.0
-            
-            logger.info(f"Training complete - Final loss: {avg_loss:.4f}")
-            
-            # Extract weights for aggregation
-            weights = self._extract_model_weights(model)
-            
-            # Send weights to coordinator for aggregation
-            self.participant._send_model_update(job_id, round_num, weights, avg_loss)
-            
-            # Optional: Clear memory after training
+                    if steps_count % 50 == 0:
+                        logger.info(f"  Epoch {epoch+1}/{epochs}, Step {steps_count}: Loss {loss.item():.4f}")
+
+                if steps_count > 0:
+                    avg_epoch_loss = epoch_loss / steps_count
+                    total_loss += avg_epoch_loss
+                    logger.info(f"  Epoch {epoch+1}/{epochs} completed - Avg Loss: {avg_epoch_loss:.4f}")
+
+            final_loss = total_loss / epochs if epochs > 0 and steps_count > 0 else 0.0
+            logger.info(f"Training complete - Final Loss: {final_loss:.4f}")
+
             if torch.cuda.is_available():
+                model.cpu()
                 torch.cuda.empty_cache()
-            # Optionally clear local batches if no longer needed immediately
-            # self.participant.local_batches = {} 
             
+            weights = self._extract_model_weights(model)
+            self.participant._send_model_update(job_id, round_num, weights, final_loss)
+
         except Exception as e:
             logger.error(f"PROC training error: {e}")
             import traceback
