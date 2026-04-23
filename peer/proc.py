@@ -146,8 +146,16 @@ class ProcNode:
             incorporated_batches = set()
             
             # Request and collect batches from PREP nodes
+            if not hasattr(self.participant, 'batch_sources') or job_id not in self.participant.batch_sources:
+                logger.warning(f"No batch sources available for job {job_id}, waiting...")
+                wait_count = 0
+                while (not hasattr(self.participant, 'batch_sources') or job_id not in self.participant.batch_sources) and wait_count < 30:
+                    time.sleep(1)
+                    wait_count += 1
+            
             if hasattr(self.participant, 'batch_sources') and job_id in self.participant.batch_sources:
                 batch_sources = self.participant.batch_sources[job_id]
+                logger.info(f"Found batch sources for job {job_id}: {len(batch_sources)} mappings")
                 
                 for batch_info in batches:
                     batch_num = batch_info.get('batch_number', 0)
@@ -156,18 +164,23 @@ class ProcNode:
                     if batch_key not in getattr(self.participant, 'local_batches', {}):
                         if str(batch_num) in batch_sources:
                             prep_info = batch_sources[str(batch_num)]
+                            prep_name = prep_info.get('name', '')
                             prep_ip = prep_info.get('ip', '')
                             prep_port = prep_info.get('port', 11130)
                             
-                            logger.info(f"Requesting batch {batch_num} from {prep_ip}:{prep_port}")
+                            logger.info(f"Requesting batch {batch_num} from {prep_name} ({prep_ip}:{prep_port})")
                             from network import request_batch_direct
-                            batch_data = request_batch_direct(prep_ip, prep_port, job_id, batch_num, timeout=10)
+                            batch_data = request_batch_direct(prep_ip, prep_port, job_id, batch_num, timeout=15)
                             
                             if batch_data:
                                 if not hasattr(self.participant, 'local_batches'):
                                     self.participant.local_batches = {}
                                 self.participant.local_batches[batch_key] = batch_data
-                                logger.info(f"Received batch {batch_num}")
+                                logger.info(f"Received batch {batch_num} successfully")
+                        else:
+                            logger.warning(f"Batch {batch_num} not found in batch_sources")
+            else:
+                logger.error(f"Still no batch sources for job {job_id} after waiting")
             
             # Collect local batches
             local_batches = getattr(self.participant, 'local_batches', {})
