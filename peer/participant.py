@@ -483,7 +483,9 @@ class Participant:
                 logger.info(f"PROC task: received federated training task via WebSocket")
                 # Queue the training task for processing
                 task_id = str(uuid.uuid4())
-                self.task_queue.put({"task_id": task_id, "type": "task_train", "data": data})
+                # Extract task data from the message (remove 'type' field)
+                task_data = {k: v for k, v in data.items() if k != 'type'}
+                self.task_queue.put({"task_id": task_id, "type": "task_train", "data": task_data})
 
             elif msg_type == "send_batch":
                 # Handle batch request from PROC node
