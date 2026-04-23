@@ -518,6 +518,10 @@ class Participant:
                     self.batch_sources = {}
                 self.batch_sources[job_id] = batch_sources
                 logger.info(f"Received batch sources for job {job_id}: {len(batch_sources)} batches")
+                
+                # Notify proc_node that batch sources are available
+                if self.proc_node:
+                    self.proc_node.handle_batch_sources(data)
 
             elif msg_type == "batch_data":
                 # Receive batch data from PREP node
@@ -532,6 +536,10 @@ class Participant:
                 if not hasattr(self, 'local_batches'):
                     self.local_batches = {}
                 self.local_batches[batch_key] = batch_data
+                
+                # Notify proc_node that a new batch is available (in case it's waiting)
+                if self.proc_node and hasattr(self.proc_node, 'handle_batch_data'):
+                    self.proc_node.handle_batch_data(data)
 
             elif msg_type == "training_stop":
                 job_id = data.get("job_id")

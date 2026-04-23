@@ -85,17 +85,53 @@ class ProcNode:
         logger.info("Stopped polling for training tasks")
 
     def _poll_loop(self):
+        """PROC polling loop - poll coordinator via HTTP for training tasks"""
         while self.polling_active and self.participant.running:
             try:
                 if self.participant.ws and self.participant.connected:
+                    # Also send WS poll message for backward compatibility
                     self.participant.ws.send(json.dumps({
                         "type": "poll",
                         "from": self.participant.name,
                         "role": "PROC"
                     }))
+                
+                # Primary method: HTTP poll for tasks
+                self._poll_for_task()
             except Exception as e:
                 logger.warning(f"Poll error: {e}")
             time.sleep(self.poll_interval)
+
+    def _poll_for_task(self):
+        """Poll coordinator for pending training tasks via HTTP"""
+        if not self.participant.role or self.participant.role != "PROC":
+            return
+        
+        try:
+            resp = requests.get(
+                f"{self.participant.coordinator_url}/api/poll/tasks",
+                params={"name": self.participant.name, "role": "PROC"},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                tasks = result.get("tasks", [])
+                if tasks:
+                    task = tasks[0]
+                    task_data = task.get("data", {})
+                    task_data["job_id"] = task.get("job_id")
+                    task_data["job_name"] = task.get("job_name")
+                    
+                    logger.info(f"PROC received task from poll: {task.get('task_type')} for job {task.get('job_id')}")
+                    
+                    # Process the task directly
+                    self.do_federated_train_task(task_data)
+                else:
+                    logger.debug("No pending PROC tasks in poll")
+            else:
+                logger.warning(f"PROC poll failed with status {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"PROC poll error: {e}")
 
     def do_federated_train_task(self, data):
         """PROC: Training task received via polling from coordinator"""
@@ -118,7 +154,16 @@ class ProcNode:
         logger.info(f"  Batches assigned: {len(batches)}")
         
         try:
-            # Initialize or load model
+            # First, ensure batch_sources are available before requesting batches
+            # Wait for batch_sources if not yet received
+            wait_for_sources = 0
+            while (not hasattr(self.participant, 'batch_sources') or 
+                   job_id not in self.participant.batch_sources) and wait_for_sources < 30:
+                logger.info(f"Waiting for batch sources for job {job_id}... ({wait_for_sources}s)")
+                time.sleep(1)
+                wait_for_sources += 1
+            
+            # Initialize or load model (after batch_sources are ready)
             if is_first_round:
                 logger.info("  Initializing model from scratch")
                 self.local_model = AutoModelForSequenceClassification.from_pretrained(

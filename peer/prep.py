@@ -56,6 +56,38 @@ class PrepNode:
                 logger.warning(f"Poll error: {e}")
             time.sleep(self.poll_interval)
 
+    def _poll_for_task(self):
+        """Poll coordinator for pending preprocessing tasks via HTTP"""
+        if not self.participant.role or self.participant.role != "PREP":
+            return
+        
+        try:
+            resp = requests.get(
+                f"{self.participant.coordinator_url}/api/poll/tasks",
+                params={"name": self.participant.name, "role": "PREP"},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                tasks = result.get("tasks", [])
+                if tasks:
+                    task = tasks[0]
+                    task_data = task.get("data", {})
+                    task_data["job_id"] = task.get("job_id")
+                    task_data["job_name"] = task.get("job_name")
+                    task_data["task_id"] = task.get("_id")
+                    
+                    logger.info(f"PREP received task from poll: {task.get('task_type')} for job {task.get('job_id')}")
+                    
+                    # Process the task directly
+                    self.do_preprocess_task(task_data)
+                else:
+                    logger.debug("No pending PREP tasks in poll")
+            else:
+                logger.warning(f"PREP poll failed with status {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"PREP poll error: {e}")
+
     def _process_task(self, task_id, task_data):
         try:
             logger.info(f"Processing task {task_id}")

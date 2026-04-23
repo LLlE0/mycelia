@@ -291,6 +291,9 @@ func (s *Server) Start() error {
 	// Model updates from PROC nodes
 	r.POST("/api/model/update", s.handleModelUpdate)
 
+	// Poll endpoint for tasks (HTTP alternative to WebSocket polling)
+	r.GET("/api/poll/tasks", s.handlePollTasks)
+
 	// Training round status
 	r.GET("/api/training/:id/round/:round", s.handleGetTrainingRound)
 
@@ -1727,6 +1730,60 @@ func (s *Server) handleBatchProgress(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "batch progress updated"})
 }
 
+func (s *Server) handlePollTasks(c *gin.Context) {
+	name := c.Query("name")
+	role := c.Query("role")
+	
+	if name == "" || role == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name and role required"})
+		return
+	}
+	
+	tasks, err := s.db.GetPendingTasksByRole(role)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	
+	// Filter tasks for this specific node if assigned
+	var nodeTasks []PendingTask
+	for _, task := range tasks {
+		if task.AssignedTo == "" || task.AssignedTo == name {
+			nodeTasks = append(nodeTasks, task)
+		}
+	}
+	
+	if len(nodeTasks) > 0 {
+		// Assign first task to this node
+		task := nodeTasks[0]
+		err = s.db.UpdatePendingTask(task.ID.Hex(), bson.M{
+			"status":      "assigned",
+			"assigned_to": name,
+		})
+		if err != nil {
+			log.Printf("Failed to assign task %s: %v", task.ID.Hex(), err)
+		} else {
+			log.Printf("Assigned task %s (%s) to %s via HTTP poll", task.ID.Hex(), task.TaskType, name)
+		}
+		
+		// Return the task
+		c.JSON(http.StatusOK, gin.H{
+			"tasks": []gin.H{
+				{
+					"_id":       task.ID.Hex(),
+					"job_id":    task.JobID,
+					"job_name":  task.JobName,
+					"task_type": task.TaskType,
+					"role":      task.Role,
+					"data":      task.Data,
+				},
+			},
+		})
+	} else {
+		c.JSON(http.StatusOK, gin.H{"tasks": []gin.H{}})
+	}
+}
+
 func (s *Server) handleModelUpdate(c *gin.Context) {
 	var update ModelUpdate
 	if err := c.ShouldBindJSON(&update); err != nil {
@@ -1917,21 +1974,7 @@ func (s *Server) startTrainingRound(jobID string) {
 			log.Printf("Saved pending training task for %s (round %d)", node, nextRound)
 		}
 
-		s.forwardToClient(node, gin.H{
-			"type":           "task_train",
-			"job_id":         jobID,
-			"round":          nextRound,
-			"batches":        nodeBatches,
-			"model_type":     job.ModelType,
-			"model_name":     job.ModelName,
-			"epochs":         job.Epochs,
-			"learning_rate":  job.LearningRate,
-			"batch_size":     job.BatchSize,
-			"threshold":      job.Threshold,
-			"is_first_round": nextRound == 1, // first round starts from scratch
-		})
-
-		log.Printf("Sent training task to %s (round %d, %d batches)", node, nextRound, len(nodeBatches))
+		log.Printf("Training task queued for %s (round %d, %d batches) - will be delivered via polling", node, nextRound, len(nodeBatches))
 	}
 
 	// Create training round record

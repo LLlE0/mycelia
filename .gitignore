@@ -1,40 +1,45 @@
 ```
-# Compiled and build artifacts
-*.pyc
+# Python
 __pycache__/
-*.o
-*.obj
-*.so
-*.dll
-*.exe
-*.class
-*.out
-
-# Dependencies
-.venv/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
 venv/
+.venv/
 .env
 .env.local
-*.env.*
+.env.*
 
-# Logs and temp files
+# Go
+*.o
+*.a
+*.so
+*.exe
+*.out
+
+# Build artifacts
+build/
+dist/
+target/
+
+# Logs
 *.log
-*.tmp
-*.swp
-*.swo
 
 # Editors
 .vscode/
 .idea/
+*.swp
+*.swo
+*.tmp
 
-# Coverage and testing
+# Coverage
 .coverage
 coverage/
 htmlcov/
-.mypy_cache/
-.pytest_cache/
 
-# OS generated files
+# OS
 .DS_Store
 Thumbs.db
 ```
