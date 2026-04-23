@@ -294,6 +294,9 @@ func (s *Server) Start() error {
 	// Poll endpoint for tasks (HTTP alternative to WebSocket polling)
 	r.GET("/api/poll/tasks", s.handlePollTasks)
 
+	// Batch sources endpoint for PROC nodes
+	r.GET("/api/batch_sources/:job_id", s.handleGetBatchSources)
+
 	// Training round status
 	r.GET("/api/training/:id/round/:round", s.handleGetTrainingRound)
 
@@ -1950,11 +1953,12 @@ func (s *Server) startTrainingRound(jobID string) {
 
 		// Save pending task to database for polling
 		pendingTask := &PendingTask{
-			JobID:    jobID,
-			JobName:  job.Name,
-			TaskType: "train",
-			Role:     "PROC",
-			Status:   "pending",
+			JobID:      jobID,
+			JobName:    job.Name,
+			TaskType:   "train",
+			Role:       "PROC",
+			Status:     "pending",
+			AssignedTo: node, // Assign to specific node
 			Data: map[string]interface{}{
 				"round":          nextRound,
 				"batches":        nodeBatches,
