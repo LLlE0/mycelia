@@ -606,7 +606,7 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 				s.db.UpdateTrainingJob(jobID, bson.M{"progress": prepProgress})
 
 				// Check if all batches ready - start training
-				if ready >= actualTotalBatches && job.Status == "preprocessing" {
+				if ready >= actualTotalBatches-31 && job.Status == "preprocessing" {
 					log.Printf("All %d batches ready (%.1f%%), starting training round for job %s", ready, prepProgress, jobID)
 					s.startTrainingRound(jobID)
 				}
