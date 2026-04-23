@@ -458,7 +458,11 @@ func (d *Database) GetBatchStats(jobID string) (total, ready, completed int) {
 	defer cancel()
 
 	total64, _ := d.batchCollection.CountDocuments(ctx, bson.M{"job_id": jobID})
-	ready64, _ := d.batchCollection.CountDocuments(ctx, bson.M{"job_id": jobID, "status": "ready"})
+	// Count both "ready" and "training" statuses as ready (consistent with server.go logic)
+	ready64, _ := d.batchCollection.CountDocuments(ctx, bson.M{
+		"job_id": jobID,
+		"status": bson.M{"$in": []string{"ready", "training"}},
+	})
 	completed64, _ := d.batchCollection.CountDocuments(ctx, bson.M{"job_id": jobID, "status": "completed"})
 	return int(total64), int(ready64), int(completed64)
 }
