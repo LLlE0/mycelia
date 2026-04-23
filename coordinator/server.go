@@ -1685,16 +1685,27 @@ func (s *Server) handleBatchProgress(c *gin.Context) {
 	}
 
 	// Check if all batches are ready
-	_, ready, _ := s.db.GetBatchStats(batch.JobID)
+	total, ready, _ := s.db.GetBatchStats(batch.JobID)
 	job, _ := s.db.GetTrainingJobByID(batch.JobID)
+	log.Printf("handleBatchProgress: job=%s, total_batches=%d, ready_batches=%d, status=%s", 
+		batch.JobID, job.TotalBatches, ready, job.Status)
 	if job != nil && ready >= job.TotalBatches && job.Status == "preprocessing" {
 		// All batches ready - start training
+		log.Printf("=== ALL BATCHES READY: %d/%d, starting training ===", ready, job.TotalBatches)
 		s.startTrainingRound(batch.JobID)
+	} else if job != nil {
+		if job.Status != "preprocessing" {
+			log.Printf("Job %s status is '%s', not 'preprocessing' - skipping startTrainingRound", batch.JobID, job.Status)
+		}
+		if ready < job.TotalBatches {
+			log.Printf("Not all batches ready yet: %d/%d", ready, job.TotalBatches)
+		}
 	}
 
 	// Update job progress
 	if job != nil {
 		prepProgress := float64(ready) / float64(job.TotalBatches) * 100
+		log.Printf("Updating job %s progress to %.1f%% (%d/%d batches)", batch.JobID, prepProgress, ready, job.TotalBatches)
 		s.db.UpdateTrainingJob(batch.JobID, bson.M{"progress": prepProgress})
 	}
 
@@ -1797,8 +1808,11 @@ func (s *Server) getAllConnectedNodes() []string {
 func (s *Server) startTrainingRound(jobID string) {
 	job, _ := s.db.GetTrainingJobByID(jobID)
 	if job == nil {
+		log.Printf("ERROR: Job %s not found in startTrainingRound", jobID)
 		return
 	}
+
+	log.Printf("=== startTrainingRound called for job %s (status=%s, round=%d) ===", jobID, job.Status, job.CurrentRound)
 
 	// Update job status
 	nextRound := job.CurrentRound + 1
@@ -1806,9 +1820,11 @@ func (s *Server) startTrainingRound(jobID string) {
 		"status":        "training",
 		"current_round": nextRound,
 	})
+	log.Printf("Updated job %s status to 'training', round %d", jobID, nextRound)
 
 	// Find PROC nodes
 	procNodes := s.findNodesByRole("PROC")
+	log.Printf("Found %d PROC nodes: %v", len(procNodes), procNodes)
 	if len(procNodes) == 0 {
 		log.Printf("No PROC nodes available for training job %s", jobID)
 		return
@@ -1816,6 +1832,7 @@ func (s *Server) startTrainingRound(jobID string) {
 
 	// Get ready batches
 	batches, _ := s.db.GetReadyBatches(jobID)
+	log.Printf("Found %d ready batches for job %s", len(batches), jobID)
 	if len(batches) == 0 {
 		log.Printf("No ready batches for training job %s", jobID)
 		return
@@ -1838,12 +1855,14 @@ func (s *Server) startTrainingRound(jobID string) {
 	}
 
 	// Send batch source info to all PROC nodes FIRST
+	log.Printf("Sending batch source info to %d PROC nodes", len(procNodes))
 	for _, node := range procNodes {
 		s.forwardToClient(node, gin.H{
 			"type":          "batch_sources",
 			"job_id":        jobID,
 			"batch_sources": batchSourceInfo,
 		})
+		log.Printf("Sent batch_sources to %s with %d batch mappings", node, len(batchSourceInfo))
 	}
 
 	// Distribute batches to PROC nodes
@@ -1910,6 +1929,7 @@ func (s *Server) startTrainingRound(jobID string) {
 		ReceivedUpdates: 0,
 	}
 	s.db.SaveTrainingRound(round)
+	log.Printf("Created training round %d for job %s with %d expected updates", nextRound, jobID, len(procNodes))
 }
 
 func (s *Server) aggregateModelUpdates(jobID string, round int) {
