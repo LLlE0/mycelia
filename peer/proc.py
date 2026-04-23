@@ -136,171 +136,86 @@ class ProcNode:
             model.train()
             
             optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-            criterion = nn.CrossEntropyLoss()
             
-            # Wait for batch sources to be available
+            # --- ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ ДЛЯ ДАННЫХ ---
+            all_sequences = []
+            all_masks = []
+            all_labels = []
+            incorporated_batches = set()
+            
+            # Ожидание batch_sources
             if not hasattr(self.participant, 'batch_sources') or job_id not in self.participant.batch_sources:
-                logger.info(f"Waiting for batch sources for job {job_id}...")
+                logger.warning(f"No batch sources available for job {job_id}, waiting...")
                 wait_count = 0
-                while (not hasattr(self.participant, 'batch_sources') or job_id not in self.participant.batch_sources) and wait_count < 60:
+                while (not hasattr(self.participant, 'batch_sources') or job_id not in self.participant.batch_sources) and wait_count < 30:
                     time.sleep(1)
                     wait_count += 1
             
-            if not hasattr(self.participant, 'batch_sources') or job_id not in self.participant.batch_sources:
-                logger.error(f"No batch sources available for job {job_id} after waiting")
-                return
-
-            batch_sources = self.participant.batch_sources[job_id]
-            logger.info(f"Found batch sources for job {job_id}: {len(batch_sources)} mappings")
-            
-            # Ensure all required batches are downloaded before training
-            # Store only metadata, not full data in memory
-            batch_metadata = []
-            
-            for batch_info in batches:
-                batch_num = batch_info.get('batch_number', 0)
-                batch_key = f"{job_id}_batch_{batch_num}"
+            # Загрузка батчей
+            if hasattr(self.participant, 'batch_sources') and job_id in self.participant.batch_sources:
+                batch_sources = self.participant.batch_sources[job_id]
+                logger.info(f"Found batch sources for job {job_id}: {len(batch_sources)} mappings")
                 
-                # Check if already downloaded
-                if batch_key not in getattr(self.participant, 'local_batches', {}):
-                    if str(batch_num) in batch_sources:
-                        prep_info = batch_sources[str(batch_num)]
-                        prep_name = prep_info.get('name', '')
-                        prep_ip = prep_info.get('ip', '')
-                        prep_port = prep_info.get('port', 11130)
-                        
-                        logger.info(f"Requesting batch {batch_num} from {prep_name} ({prep_ip}:{prep_port})")
-                        from network import request_batch_direct
-                        batch_data = request_batch_direct(prep_ip, prep_port, job_id, batch_num, timeout=30)
-                        
-                        if batch_data:
-                            if not hasattr(self.participant, 'local_batches'):
-                                self.participant.local_batches = {}
-                            self.participant.local_batches[batch_key] = batch_data
-                            logger.info(f"Received batch {batch_num} successfully")
+                for batch_info in batches:
+                    batch_num = batch_info.get('batch_number', 0)
+                    batch_key = f"{job_id}_batch_{batch_num}"
+                    
+                    # Проверяем, есть ли уже в локальном кэше
+                    local_batches = getattr(self.participant, 'local_batches', {})
+                    if batch_key not in local_batches:
+                        if str(batch_num) in batch_sources:
+                            prep_info = batch_sources[str(batch_num)]
+                            prep_name = prep_info.get('name', '')
+                            prep_ip = prep_info.get('ip', '')
+                            prep_port = prep_info.get('port', 11130)
+                            
+                            logger.info(f"Requesting batch {batch_num} from {prep_name} ({prep_ip}:{prep_port})")
+                            from network import request_batch_direct
+                            batch_data = request_batch_direct(prep_ip, prep_port, job_id, batch_num, timeout=15)
+                            
+                            if batch_data:
+                                if not hasattr(self.participant, 'local_batches'):
+                                    self.participant.local_batches = {}
+                                self.participant.local_batches[batch_key] = batch_data
+                                logger.info(f"Received batch {batch_num} successfully")
                         else:
-                            logger.error(f"Failed to download batch {batch_num}")
-                    else:
-                        logger.warning(f"Batch {batch_num} not found in batch_sources")
-                else:
-                    logger.debug(f"Batch {batch_num} already in memory")
-                
-                batch_metadata.append(batch_num)
-
-            # Verify we have data
+                            logger.warning(f"Batch {batch_num} not found in batch_sources")
+            
+            # Сбор данных из локальных батчей
             local_batches = getattr(self.participant, 'local_batches', {})
-            available_count = sum(1 for bn in batch_metadata if f"{job_id}_batch_{bn}" in local_batches)
+            for batch_key, batch_data in local_batches.items():
+                if batch_key.startswith(f"{job_id}_batch_") and batch_key not in incorporated_batches:
+                    batch_num = int(batch_key.split('_')[-1])
+                    incorporated_batches.add(batch_key)
+                    
+                    # Используем input_ids
+                    seqs = batch_data.get("input_ids", [])
+                    masks = batch_data.get("attention_mask", [])
+                    
+                    all_sequences.extend(seqs)
+                    all_masks.extend(masks)
+                    # Предполагаем, что метки 0, если их нет в данных (заглушка для примера)
+                    # В реальном сценарии метки должны приходить с данными
+                    all_labels.extend([0] * len(seqs))
+                    logger.info(f"Added batch {batch_num} to training data ({len(seqs)} samples)")
             
-            if available_count == 0:
-                logger.error("No data available for training after downloading")
-                return
-
-            logger.info(f"Starting training with {available_count} batches loaded")
-            
-            # Helper function to get a single batch tensor
-            def get_batch_tensor(batch_num):
-                batch_key = f"{job_id}_batch_{batch_num}"
-                if batch_key not in local_batches:
-                    return None
-                
-                batch_data = local_batches[batch_key]
-                input_ids = batch_data.get("input_ids", [])
-                attention_mask = batch_data.get("attention_mask", [])
-                
-                if not input_ids:
-                    return None
-                
-                # Pad to max length
-                model_max_length = 512
-                padded_seqs = []
-                padded_masks = []
-                
-                for seq, mask in zip(input_ids, attention_mask):
-                    if len(seq) < model_max_length:
-                        seq = seq + [0] * (model_max_length - len(seq))
-                        mask = mask + [0] * (model_max_length - len(mask))
-                    else:
-                        seq = seq[:model_max_length]
-                        mask = mask[:model_max_length]
-                    padded_seqs.append(seq)
-                    padded_masks.append(mask)
-                
-                ids_tensor = torch.tensor(padded_seqs, dtype=torch.long)
-                mask_tensor = torch.tensor(padded_masks, dtype=torch.long)
-                # Labels are assumed 0 for this example, adjust if needed
-                labels_tensor = torch.zeros(len(ids_tensor), dtype=torch.long)
-                
-                return ids_tensor, mask_tensor, labels_tensor
-
-            # Create a custom dataset that loads batches on demand to save memory
-            class StreamingDataset(torch.utils.data.Dataset):
-                def __init__(self, batch_nums, get_batch_fn):
-                    self.batch_nums = batch_nums
-                    self.get_batch_fn = get_batch_fn
-                    self._cache = {} # Cache individual samples if needed, but better to cache whole batches
-                    
-                    # Pre-load all batches into a single large tensor structure? 
-                    # No, that causes OOM. Instead, we keep them separate and index logically.
-                    # Actually, for simplicity and speed with small number of batches (32), 
-                    # we can concatenate them once here IF they fit. 
-                    # But since we just OOMed, let's try to be smarter.
-                    # We will just store the list of tensors and index into them.
-                    
-                    self.all_ids = []
-                    self.all_masks = []
-                    self.all_labels = []
-                    
-                    logger.info("Concatenating batches for dataset...")
-                    for bn in self.batch_nums:
-                        res = self.get_batch_fn(bn)
-                        if res:
-                            ids, masks, labels = res
-                            self.all_ids.append(ids)
-                            self.all_masks.append(masks)
-                            self.all_labels.append(labels)
-                    
-                    if self.all_ids:
-                        self.total_len = sum(t.shape[0] for t in self.all_ids)
-                        logger.info(f"Total samples in dataset: {self.total_len}")
-                    else:
-                        self.total_len = 0
-
-                def __len__(self):
-                    return self.total_len
-
-                def __getitem__(self, idx):
-                    # Find which batch this index belongs to
-                    current_idx = 0
-                    for i, ids_tensor in enumerate(self.all_ids):
-                        batch_len = ids_tensor.shape[0]
-                        if idx < current_idx + batch_len:
-                            local_idx = idx - current_idx
-                            return (
-                                self.all_ids[i][local_idx],
-                                self.all_masks[i][local_idx],
-                                self.all_labels[i][local_idx]
-                            )
-                        current_idx += batch_len
-                    raise IndexError("Index out of range")
-
             if not all_sequences:
-                logger.error("No data available for training")
+                logger.error("No data available for training after loading batches")
                 return
-            
-            # --- ИСПРАВЛЕНИЕ: Создаем датасет БЕЗ гигантских тензоров в памяти сразу ---
-            # Храним данные как обычные списки Python, тензоры создаются только при запросе элемента
-            
+
+            logger.info(f"Prepared {len(all_sequences)} samples for training")
+
+            # --- СОЗДАНИЕ DATASET И DATALOADER ---
             class FederatedDataset(torch.utils.data.Dataset):
                 def __init__(self, sequences, masks, labels):
-                    self.sequences = sequences  # Список списков
-                    self.masks = masks          # Список списков
-                    self.labels = labels        # Список чисел
+                    self.sequences = sequences
+                    self.masks = masks
+                    self.labels = labels
 
                 def __len__(self):
                     return len(self.sequences)
 
                 def __getitem__(self, idx):
-                    # Создаем тензоры только для одного элемента
                     return {
                         'input_ids': torch.tensor(self.sequences[idx], dtype=torch.long),
                         'attention_mask': torch.tensor(self.masks[idx], dtype=torch.long),
@@ -315,14 +230,14 @@ class ProcNode:
 
             logger.info(f"Starting training loop: {len(dataloader)} steps per epoch, batch_size={effective_batch_size}")
             
-            # Освобождаем память перед обучением
+            # Освобождаем память перед началом обучения
             import gc
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                model = model.cuda()
+                model.cuda() # Перемещаем модель на GPU
 
-            model.train()
+            # Training loop
             total_loss = 0
             steps_count = 0
 
@@ -337,9 +252,10 @@ class ProcNode:
                     if not self.training_active:
                         break
 
-                    input_ids = batch['input_ids'].to('cuda' if torch.cuda.is_available() else 'cpu')
-                    attention_mask = batch['attention_mask'].to('cuda' if torch.cuda.is_available() else 'cpu')
-                    labels = batch['labels'].to('cuda' if torch.cuda.is_available() else 'cpu')
+                    # Переносим только текущий мини-батч на GPU
+                    input_ids = batch['input_ids'].to('cuda')
+                    attention_mask = batch['attention_mask'].to('cuda')
+                    labels = batch['labels'].to('cuda')
 
                     optimizer.zero_grad()
                     
@@ -363,23 +279,31 @@ class ProcNode:
                     avg_epoch_loss = epoch_loss / steps_count
                     total_loss += avg_epoch_loss
                     logger.info(f"  Epoch {epoch+1}/{epochs} completed - Avg Loss: {avg_epoch_loss:.4f}")
+                else:
+                    logger.warning(f"  Epoch {epoch+1} had no steps!")
 
-            final_loss = total_loss / epochs if epochs > 0 and steps_count > 0 else 0.0
+            if epochs > 0 and steps_count > 0:
+                final_loss = total_loss / epochs
+            else:
+                final_loss = 0.0
+
             logger.info(f"Training complete - Final Loss: {final_loss:.4f}")
 
+            # Очистка памяти перед отправкой весов
             if torch.cuda.is_available():
                 model.cpu()
                 torch.cuda.empty_cache()
             
+            # Extract weights for aggregation
             weights = self._extract_model_weights(model)
+            
+            # Send weights to coordinator for aggregation
             self.participant._send_model_update(job_id, round_num, weights, final_loss)
-
+            
         except Exception as e:
             logger.error(f"PROC training error: {e}")
             import traceback
             traceback.print_exc()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     def _extract_model_weights(self, model):
         """Extract model weights as dictionary"""
