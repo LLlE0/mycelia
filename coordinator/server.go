@@ -597,12 +597,17 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 						ready++
 					}
 				}
-				prepProgress := float64(ready) / float64(job.TotalBatches) * 100
+				// Calculate actual total batches based on dataset size and batch size (ceiling division)
+				actualTotalBatches := job.TotalBatches
+				if job.DatasetSize > 0 && job.BatchSize > 0 {
+					actualTotalBatches = (job.DatasetSize + job.BatchSize - 1) / job.BatchSize
+				}
+				prepProgress := float64(ready) / float64(actualTotalBatches) * 100
 				s.db.UpdateTrainingJob(jobID, bson.M{"progress": prepProgress})
 
-				// Check if all batches ready - start training (relaxed condition)
-				if ready >= job.TotalBatches && job.Status == "preprocessing" {
-					log.Printf("All %d batches ready (%.1f%%), starting training round for job %s", ready, float64(ready)/float64(job.TotalBatches)*100, jobID)
+				// Check if all batches ready - start training
+				if ready >= actualTotalBatches && job.Status == "preprocessing" {
+					log.Printf("All %d batches ready (%.1f%%), starting training round for job %s", ready, prepProgress, jobID)
 					s.startTrainingRound(jobID)
 				}
 			}
@@ -654,8 +659,14 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 							ready++
 						}
 					}
-					if ready >= job.TotalBatches {
-						log.Printf("All %d batches ready (%.1f%%), starting training round for job %s (triggered by task_completed)", ready, float64(ready)/float64(job.TotalBatches)*100, jobID)
+					// Calculate actual total batches based on dataset size and batch size (ceiling division)
+					actualTotalBatches := job.TotalBatches
+					if job.DatasetSize > 0 && job.BatchSize > 0 {
+						actualTotalBatches = (job.DatasetSize + job.BatchSize - 1) / job.BatchSize
+					}
+					if ready >= actualTotalBatches {
+						prepProgress := float64(ready) / float64(actualTotalBatches) * 100
+						log.Printf("All %d batches ready (%.1f%%), starting training round for job %s (triggered by task_completed)", ready, prepProgress, jobID)
 						s.startTrainingRound(jobID)
 					}
 				}
@@ -1366,10 +1377,14 @@ func (s *Server) startTrainingJob(id string) {
 	s.db.UpdateTrainingJob(id, bson.M{"status": "preprocessing", "current_round": 0})
 
 	// Create preprocessing subtasks divided by 1000 rows each
-	dataset_size := job.TotalBatches * job.BatchSize
+	// Use actual DatasetSize, not TotalBatches * BatchSize (which may be larger due to ceiling)
+	dataset_size := job.DatasetSize
+	if dataset_size == 0 {
+		dataset_size = job.TotalBatches * job.BatchSize
+	}
 	subtask_size := 1000
 	num_subtasks := (dataset_size + subtask_size - 1) / subtask_size
-	log.Printf("Creating %d subtasks for dataset size %d", num_subtasks, dataset_size)
+	log.Printf("Creating %d subtasks for dataset size %d (total_batches=%d, batch_size=%d)", num_subtasks, dataset_size, job.TotalBatches, job.BatchSize)
 	for i := 0; i < num_subtasks; i++ {
 		start_offset := i * subtask_size
 		end_offset := start_offset + subtask_size

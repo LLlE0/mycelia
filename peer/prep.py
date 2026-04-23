@@ -114,8 +114,9 @@ class PrepNode:
         logger.info(f"  Records: {start_offset}-{end_offset}, Batch size: {batch_size}")
 
         try:
+            # Calculate total batches properly - handle non-integer division
             total_records_needed = end_offset - start_offset
-            total_batches = max(1, total_records_needed // batch_size)
+            total_batches = (total_records_needed + batch_size - 1) // batch_size  # Ceiling division
 
             logger.info(f"  Loading {total_records_needed} records from offset={start_offset}")
             dataset = self._load_dataset(dataset_url, dataset_type, offset=start_offset, length=total_records_needed)
