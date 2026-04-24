@@ -18,13 +18,16 @@ logger = logging.getLogger(__name__)
 class PrepNode:
     """PREP node handles dataset preprocessing and batch storage"""
     
-    # Available encoders
     ENCODERS = {
         "bert": "bert-base-uncased",
         "roberta": "roberta-base",
         "distilbert": "distilbert-base-uncased",
         "sentence-transformer": "paraphrase-multilingual-MiniLM-L12-v2",
     }
+    
+    # 🔹 Расширенный список возможных имён колонок с метками
+    LABEL_COLUMNS = ['label', 'labels', 'target', 'targets', 'class', 'classes', 
+                     'y', 'category', 'sentiment', 'score', 'rating', 'outcome']
     
     def __init__(self, participant):
         self.participant = participant
@@ -55,6 +58,20 @@ class PrepNode:
             except Exception as e:
                 logger.warning(f"Poll error: {e}")
             time.sleep(self.poll_interval)
+
+    def _poll_for_task(self):
+        """Poll coordinator for preprocessing tasks"""
+        if not self.participant.ws or not self.participant.connected:
+            return
+        
+        try:
+            self.participant.ws.send(json.dumps({
+                "type": "poll",
+                "from": self.participant.name,
+                "role": "PREP"
+            }))
+        except Exception as e:
+            logger.warning(f"Poll send error: {e}")
 
     def _process_task(self, task_id, task_data):
         try:
@@ -114,14 +131,21 @@ class PrepNode:
         logger.info(f"  Records: {start_offset}-{end_offset}, Batch size: {batch_size}")
 
         try:
-            # Calculate total batches properly - handle non-integer division
             total_records_needed = end_offset - start_offset
-            total_batches = (total_records_needed + batch_size - 1) // batch_size  # Ceiling division
+            total_batches = (total_records_needed + batch_size - 1) // batch_size
 
             logger.info(f"  Loading {total_records_needed} records from offset={start_offset}")
             dataset = self._load_dataset(dataset_url, dataset_type, offset=start_offset, length=total_records_needed)
             total_records = len(dataset)
             logger.info(f"  Loaded {total_records} records")
+            
+            # 🔹 ОТЛАДКА: Выводим все колонки датасета
+            logger.info(f"  Dataset columns: {list(dataset.columns)}")
+            logger.info(f"  Dataset sample (first row): {dataset.iloc[0].to_dict()}")
+            
+            # 🔹 Поиск колонки с метками
+            label_column = self._find_label_column(dataset)
+            logger.info(f"  Label column found: {label_column}")
             
             logger.info("  Loading tokenizer...")
             tokenizer = self._get_tokenizer(model_name)
@@ -178,17 +202,14 @@ class PrepNode:
                 
                 batch_key = f"{job_id}_batch_{batch_num}"
                 
-                # Extract labels if available in dataset
-                batch_labels = []
-                if 'label' in dataset.columns:
-                    batch_labels = dataset['label'].iloc[start_idx:end_idx].tolist()
-                elif 'labels' in dataset.columns:
-                    batch_labels = dataset['labels'].iloc[start_idx:end_idx].tolist()
-                elif 'target' in dataset.columns:
-                    batch_labels = dataset['target'].iloc[start_idx:end_idx].tolist()
-                else:
-                    # Default to 0 if no labels found
-                    batch_labels = [0] * (end_idx - start_idx)
+                # 🔹 Извлечение меток через универсальный метод
+                batch_labels = self._extract_labels(dataset, label_column, start_idx, end_idx)
+                
+                # 🔹 Отладка: первые метки батча
+                if i == 0:
+                    logger.info(f"  First batch labels sample: {batch_labels[:10]}")
+                    unique = list(set(batch_labels))
+                    logger.info(f"  Unique labels in batch: {unique}")
                 
                 stored_data = {
                     "embeddings": batch_embeddings.cpu().tolist(),
@@ -204,6 +225,9 @@ class PrepNode:
             
             logger.info(f"PREP: Completed preprocessing for job {job_id}")
             
+            # 🔹 После завершения — сразу поллим координатор на новые задачи!
+            self._poll_for_task()
+            
         except Exception as e:
             logger.error(f"PREP error: {e}")
             import traceback
@@ -215,6 +239,35 @@ class PrepNode:
                     "job_id": job_id,
                     "error": str(e)
                 }))
+    
+    def _find_label_column(self, dataset):
+        """Находит колонку с метками в датасете"""
+        # Проверяем известные имена
+        for col in self.LABEL_COLUMNS:
+            if col in dataset.columns:
+                return col
+        
+        # 🔹 Ищем колонку с числовыми значениями (кроме текста и ID)
+        numeric_cols = dataset.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
+        for col in numeric_cols:
+            if col.lower() not in ['id', 'index', 'idx', 'count', 'len']:
+                # Проверяем, что значения — дискретные (потенциальные классы)
+                unique_vals = dataset[col].dropna().unique()
+                if len(unique_vals) <= 100:  # Разумное количество классов
+                    logger.info(f"  Guessed label column: {col} (unique values: {unique_vals[:10]})")
+                    return col
+        
+        return None
+    
+    def _extract_labels(self, dataset, label_column, start_idx, end_idx):
+        """Извлекает метки из датасета"""
+        if label_column and label_column in dataset.columns:
+            labels = dataset[label_column].iloc[start_idx:end_idx].tolist()
+            # Конвертируем в int, если нужно
+            return [int(l) if isinstance(l, (int, float, str)) and str(l).isdigit() else l for l in labels]
+        else:
+            logger.warning(f"  No label column found! Using default label 0")
+            return [0] * (end_idx - start_idx)
     
     def _load_dataset(self, url, dataset_type, offset=0, length=None):
         if "huggingface.co/datasets" in url:
@@ -289,8 +342,10 @@ class PrepNode:
             "Computer vision enables machines to see and understand images.",
             "Reinforcement learning trains agents through rewards and penalties.",
         ]
+        # 🔹 Генерируем данные с РАЗНЫМИ метками для тестирования
         texts = sample_texts * 500
-        return pd.DataFrame({"text": texts})
+        labels = [i % 2 for i in range(len(texts))]  # Чередование 0 и 1
+        return pd.DataFrame({"text": texts, "label": labels})
     
     def _get_tokenizer(self, model_name):
         cache_key = f"tokenizer_{model_name}"
