@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 class PrepNode:
     """PREP node handles dataset preprocessing and batch storage"""
     
+    # Available encoders
     ENCODERS = {
         "bert": "bert-base-uncased",
         "roberta": "roberta-base",
@@ -141,7 +142,8 @@ class PrepNode:
             
             # 🔹 ОТЛАДКА: Выводим все колонки датасета
             logger.info(f"  Dataset columns: {list(dataset.columns)}")
-            logger.info(f"  Dataset sample (first row): {dataset.iloc[0].to_dict()}")
+            if len(dataset) > 0:
+                logger.info(f"  Dataset sample (first row): {dataset.iloc[0].to_dict()}")
             
             # 🔹 Поиск колонки с метками
             label_column = self._find_label_column(dataset)
@@ -253,9 +255,8 @@ class PrepNode:
             if col.lower() not in ['id', 'index', 'idx', 'count', 'len']:
                 # Проверяем, что значения — дискретные (потенциальные классы)
                 unique_vals = dataset[col].dropna().unique()
-                if len(unique_vals) <= 100:  # Разумное количество классов
-                    logger.info(f"  Guessed label column: {col} (unique values: {unique_vals[:10]})")
-                    return col
+                logger.info(f"  Guessed label column: {col} (unique values: {unique_vals[:10]})")
+                return col
         
         return None
     
@@ -295,24 +296,61 @@ class PrepNode:
         return self._generate_sample_data()
     
     def _load_huggingface_rows(self, dataset_path, offset=0, length=100):
-        rows_url = f"https://datasets-server.huggingface.co/rows?dataset={dataset_path}&config=default&split=train&offset={offset}&length={length}"
-        logger.info(f"Loading HF rows API: {rows_url}")
+        """
+        Загружает строки из HuggingFace Datasets Server API с пагинацией.
+        API ограничивает length <= 100, поэтому делаем несколько запросов при необходимости.
+        """
+        MAX_PER_REQUEST = 100  # 🔹 Лимит API
+        all_rows = []
+        remaining = length
+        current_offset = offset
         
-        try:
-            resp = requests.get(rows_url, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            rows = data.get("rows", [])
-            logger.info(f"Loaded {len(rows)} rows from HF rows API")
+        logger.info(f"Loading HF data: offset={offset}, length={length} (paginated, max {MAX_PER_REQUEST}/req)")
+        
+        while remaining > 0:
+            batch_size = min(remaining, MAX_PER_REQUEST)
+            rows_url = (
+                f"https://datasets-server.huggingface.co/rows"
+                f"?dataset={dataset_path}"
+                f"&config=default"
+                f"&split=train"
+                f"&offset={current_offset}"
+                f"&length={batch_size}"
+            )
             
-            if not rows:
-                raise ValueError("No rows returned from HF API")
-            
-            row_data = [row["row"] for row in rows]
-            return pd.DataFrame(row_data)
-        except Exception as e:
-            logger.error(f"HF rows API failed: {e}")
-            return self._generate_sample_data()
+            try:
+                resp = requests.get(rows_url, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                rows = data.get("rows", [])
+                
+                if not rows:
+                    logger.warning(f"No more rows at offset {current_offset}, stopping pagination")
+                    break
+                
+                # 🔹 Извлекаем только данные строки (без метаданных)
+                for row in rows:
+                    all_rows.append(row["row"])
+                
+                loaded = len(rows)
+                remaining -= loaded
+                current_offset += loaded
+                
+                logger.debug(f"  Loaded {loaded} rows (offset {current_offset - loaded}), remaining: {remaining}")
+                
+            except Exception as e:
+                logger.error(f"HF API request failed at offset {current_offset}: {e}")
+                if all_rows:
+                    logger.warning(f"Returning partial data: {len(all_rows)} rows")
+                    break
+                else:
+                    raise
+        
+        if not all_rows:
+            raise ValueError(f"No data loaded from HF dataset '{dataset_path}' at offset {offset}")
+        
+        logger.info(f"Total loaded: {len(all_rows)} rows from HF API")
+        return pd.DataFrame(all_rows)
     
     def _load_huggingface_dataset(self, url, dataset_type, offset=0, length=100):
         if "huggingface.co/datasets/" in url:
