@@ -244,19 +244,21 @@ class PrepNode:
     
     def _find_label_column(self, dataset):
         """Находит колонку с метками в датасете"""
-        # Проверяем известные имена
+        # 🔹 Сначала проверяем известные имена — берём без фильтра по уникальным значениям!
         for col in self.LABEL_COLUMNS:
             if col in dataset.columns:
+                unique_vals = dataset[col].dropna().unique()
+                logger.info(f"  Found label column '{col}' with {len(unique_vals)} unique values: {sorted(unique_vals)[:10]}...")
                 return col
         
-        # 🔹 Ищем колонку с числовыми значениями (кроме текста и ID)
+        # 🔹 Эвристика для неизвестных имён: ищем числовые колонки с дискретными значениями
         numeric_cols = dataset.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
         for col in numeric_cols:
-            if col.lower() not in ['id', 'index', 'idx', 'count', 'len']:
-                # Проверяем, что значения — дискретные (потенциальные классы)
+            if col.lower() not in ['id', 'index', 'idx', 'count', 'len', 'row_idx']:
                 unique_vals = dataset[col].dropna().unique()
-                logger.info(f"  Guessed label column: {col} (unique values: {unique_vals[:10]})")
-                return col
+                if 1 < len(unique_vals) <= 500:  # Увеличили лимит для гибкости
+                    logger.info(f"  Guessed label column: {col} (unique values: {len(unique_vals)}, sample: {unique_vals[:10]})")
+                    return col
         
         return None
     
@@ -264,7 +266,6 @@ class PrepNode:
         """Извлекает метки из датасета"""
         if label_column and label_column in dataset.columns:
             labels = dataset[label_column].iloc[start_idx:end_idx].tolist()
-            # Конвертируем в int, если нужно
             return [int(l) if isinstance(l, (int, float, str)) and str(l).isdigit() else l for l in labels]
         else:
             logger.warning(f"  No label column found! Using default label 0")
@@ -298,15 +299,19 @@ class PrepNode:
     def _load_huggingface_rows(self, dataset_path, offset=0, length=100):
         """
         Загружает строки из HuggingFace Datasets Server API с пагинацией.
-        API ограничивает length <= 100, поэтому делаем несколько запросов при необходимости.
+        🔹 Защита от 429: задержки между запросами + автоматический повтор.
         """
-        MAX_PER_REQUEST = 100  # 🔹 Лимит API
+        MAX_PER_REQUEST = 100
+        REQUEST_DELAY = 1.5        # Задержка между успешными запросами (сек)
+        RATE_LIMIT_WAIT = 10.0     # Задержка при получении 429 (сек)
+        MAX_RETRIES = 2            # Максимум повторов при ошибке сети
+
         all_rows = []
         remaining = length
         current_offset = offset
-        
-        logger.info(f"Loading HF data: offset={offset}, length={length} (paginated, max {MAX_PER_REQUEST}/req)")
-        
+
+        logger.info(f"Loading HF  offset={offset}, length={length} (paginated, max {MAX_PER_REQUEST}/req)")
+
         while remaining > 0:
             batch_size = min(remaining, MAX_PER_REQUEST)
             rows_url = (
@@ -317,38 +322,58 @@ class PrepNode:
                 f"&offset={current_offset}"
                 f"&length={batch_size}"
             )
-            
-            try:
-                resp = requests.get(rows_url, timeout=30)
-                resp.raise_for_status()
-                data = resp.json()
-                rows = data.get("rows", [])
-                
-                if not rows:
-                    logger.warning(f"No more rows at offset {current_offset}, stopping pagination")
+
+            success = False
+            for attempt in range(MAX_RETRIES + 1):
+                try:
+                    resp = requests.get(rows_url, timeout=30)
+                    
+                    # 🔹 Обработка 429 Too Many Requests
+                    if resp.status_code == 429:
+                        wait = RATE_LIMIT_WAIT * (attempt + 1)
+                        logger.warning(f"⏳ Rate limit (429). Waiting {wait}s before retry {attempt+1}/{MAX_RETRIES+1}...")
+                        time.sleep(wait)
+                        continue
+                    
+                    resp.raise_for_status()
+                    data = resp.json()
+                    rows = data.get("rows", [])
+                    success = True
                     break
-                
-                # 🔹 Извлекаем только данные строки (без метаданных)
-                for row in rows:
-                    all_rows.append(row["row"])
-                
-                loaded = len(rows)
-                remaining -= loaded
-                current_offset += loaded
-                
-                logger.debug(f"  Loaded {loaded} rows (offset {current_offset - loaded}), remaining: {remaining}")
-                
-            except Exception as e:
-                logger.error(f"HF API request failed at offset {current_offset}: {e}")
-                if all_rows:
-                    logger.warning(f"Returning partial data: {len(all_rows)} rows")
-                    break
-                else:
-                    raise
-        
+                    
+                except requests.RequestException as e:
+                    logger.error(f"Network error at offset {current_offset}: {e}")
+                    if attempt < MAX_RETRIES:
+                        wait = 2 ** attempt
+                        logger.warning(f"Retrying in {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        raise
+
+            if not success:
+                logger.error(f"Failed to load batch at offset {current_offset} after {MAX_RETRIES} retries")
+                break
+
+            if not rows:
+                logger.warning(f"No more rows at offset {current_offset}, stopping pagination")
+                break
+
+            # Извлекаем только данные строки
+            for row in rows:
+                all_rows.append(row["row"])
+
+            loaded = len(rows)
+            remaining -= loaded
+            current_offset += loaded
+            logger.debug(f"  Loaded {loaded} rows (offset {current_offset - loaded}), remaining: {remaining}")
+
+            # 🔹 Задержка перед следующим запросом, чтобы не получить 429
+            if remaining > 0:
+                time.sleep(REQUEST_DELAY)
+
         if not all_rows:
             raise ValueError(f"No data loaded from HF dataset '{dataset_path}' at offset {offset}")
-        
+
         logger.info(f"Total loaded: {len(all_rows)} rows from HF API")
         return pd.DataFrame(all_rows)
     
@@ -380,9 +405,8 @@ class PrepNode:
             "Computer vision enables machines to see and understand images.",
             "Reinforcement learning trains agents through rewards and penalties.",
         ]
-        # 🔹 Генерируем данные с РАЗНЫМИ метками для тестирования
         texts = sample_texts * 500
-        labels = [i % 2 for i in range(len(texts))]  # Чередование 0 и 1
+        labels = [i % 2 for i in range(len(texts))]
         return pd.DataFrame({"text": texts, "label": labels})
     
     def _get_tokenizer(self, model_name):
