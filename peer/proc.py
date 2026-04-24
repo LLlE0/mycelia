@@ -106,8 +106,14 @@ class ProcNode:
         batches = data.get("batches", [])
         model_name = data.get("model_name", "bert-base-uncased")
         epochs = data.get("epochs", 3)
-        learning_rate = data.get("learning_rate", 0.001)
-        batch_size = data.get("batch_size", 32)  # Используем как есть, без ограничений!
+        
+        # 🔹 БЕЗОПАСНЫЙ LEARNING RATE: по умолчанию 2e-5 для BERT
+        learning_rate = float(data.get("learning_rate", 2e-5))
+        if learning_rate > 1e-3:  # Защита от слишком высокого LR
+            logger.warning(f"Learning rate {learning_rate} is too high for BERT, capping to 2e-5")
+            learning_rate = 2e-5
+            
+        batch_size = data.get("batch_size", 32)
         is_first_round = data.get("is_first_round", True)
         
         self.participant.current_job_id = job_id
@@ -135,7 +141,7 @@ class ProcNode:
             model = self.local_model
             model.train()
             
-            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)  # 🔹 AdamW вместо Adam для BERT
             
             # --- ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ ДЛЯ ДАННЫХ ---
             all_sequences = []
@@ -151,8 +157,8 @@ class ProcNode:
                     time.sleep(1)
                     wait_count += 1
             
-            # 🔹 Загрузка батчей - ограничиваем КОЛИЧЕСТВО, но не размер каждого батча!
-            max_batches_to_load = min(len(batches), 64)  # Контролируем память через количество батчей
+            # Загрузка батчей - ограничиваем КОЛИЧЕСТВО, но не размер каждого батча!
+            max_batches_to_load = min(len(batches), 64)
             
             if hasattr(self.participant, 'batch_sources') and job_id in self.participant.batch_sources:
                 batch_sources = self.participant.batch_sources[job_id]
@@ -207,7 +213,7 @@ class ProcNode:
                     
                     seqs = batch_data.get("input_ids", [])
                     masks = batch_data.get("attention_mask", [])
-                    labels_from_batch = batch_data.get("labels", None)  # 🔹 Теперь метки приходят из prep.py
+                    labels_from_batch = batch_data.get("labels", None)
                     
                     all_sequences.extend(seqs)
                     all_masks.extend(masks)
@@ -226,6 +232,12 @@ class ProcNode:
                 return
 
             logger.info(f"Prepared {len(all_sequences)} samples for training")
+            
+            # 🔹 ОТЛАДКА: Проверка распределения меток
+            unique_labels = list(set(all_labels))
+            logger.info(f"Unique labels in dataset: {unique_labels}")
+            if len(unique_labels) == 1:
+                logger.warning(f"⚠️ All labels are {unique_labels[0]}! Model won't learn meaningful patterns.")
 
             # --- DATASET И DATALOADER ---
             class FederatedDataset(torch.utils.data.Dataset):
@@ -245,8 +257,6 @@ class ProcNode:
                     }
 
             dataset = FederatedDataset(all_sequences, all_masks, all_labels)
-            
-            # 🔹 Используем оригинальный batch_size из конфигурации!
             dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
             logger.info(f"Starting training loop: {len(dataloader)} steps per epoch, batch_size={batch_size}")
@@ -271,19 +281,19 @@ class ProcNode:
                 if not self.training_active:
                     break
                 
+                model.train()  # 🔹 Явно устанавливаем режим обучения
                 epoch_loss = 0.0
                 steps_count = 0
-                current_loss = 0.0  # 🔹 Гарантированная инициализация для логирования
                 
                 for batch_idx, batch in enumerate(dataloader):
                     if not self.training_active:
                         break
 
-                    input_ids = batch['input_ids'].to('cuda')
-                    attention_mask = batch['attention_mask'].to('cuda')
-                    labels = batch['labels'].to('cuda')
+                    input_ids = batch['input_ids'].to('cuda', non_blocking=True)
+                    attention_mask = batch['attention_mask'].to('cuda', non_blocking=True)
+                    labels = batch['labels'].to('cuda', non_blocking=True)
 
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)  # 🔹 Более эффективный сброс градиентов
                     
                     outputs = model(
                         input_ids=input_ids,
@@ -291,21 +301,39 @@ class ProcNode:
                         labels=labels
                     )
                     
-                    current_loss = outputs.loss  # 🔹 Присваиваем перед использованием
-                    current_loss.backward()
+                    loss = outputs.loss
+                    
+                    # 🔹 Проверка на NaN/Inf
+                    if not torch.isfinite(loss):
+                        logger.warning(f"Non-finite loss detected: {loss.item()}, skipping batch")
+                        del input_ids, attention_mask, labels, outputs, loss
+                        continue
+                    
+                    loss.backward()
+                    
+                    # 🔹 Gradient Clipping для стабильности
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
                     optimizer.step()
 
-                    epoch_loss += current_loss.item()
+                    # 🔹 Безопасное накопление: сразу извлекаем float
+                    loss_value = loss.item()
+                    epoch_loss += loss_value
                     steps_count += 1
                     
-                    # 🔹 Агрессивная очистка памяти после каждого батча
-                    del input_ids, attention_mask, labels, outputs, current_loss
+                    # 🔹 Отладочный лог на первом шаге первой эпохи
+                    if epoch == 0 and batch_idx == 0:
+                        with torch.no_grad():
+                            preds = torch.argmax(outputs.logits, dim=-1)
+                            logger.info(f"Debug - First batch: labels={labels[:5].cpu().tolist()}, preds={preds[:5].cpu().tolist()}, loss={loss_value:.4f}")
+                    
+                    # 🔹 Очистка памяти ТОЛЬКО после использования loss
+                    del input_ids, attention_mask, labels, outputs, loss
                     if torch.cuda.is_available() and batch_idx % 10 == 0:
                         torch.cuda.empty_cache()
                     
-                    # 🔹 Безопасное логирование: используем current_loss, который точно определён
-                    if steps_count % 50 == 0:
-                        logger.info(f"  Epoch {epoch+1}/{epochs}, Step {steps_count}: Loss {current_loss.item():.4f}")
+                    if steps_count % 10 == 0:  # 🔹 Чаще логируем (каждые 10 шагов)
+                        logger.info(f"  Epoch {epoch+1}/{epochs}, Step {steps_count}/{len(dataloader)}: Loss {loss_value:.4f}")
 
                 if steps_count > 0:
                     avg_epoch_loss = epoch_loss / steps_count
