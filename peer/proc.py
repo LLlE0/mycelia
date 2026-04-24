@@ -8,6 +8,7 @@ import json
 import logging
 import time
 import threading
+import gc
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -151,12 +152,19 @@ class ProcNode:
                     time.sleep(1)
                     wait_count += 1
             
-            # Загрузка батчей
+            # Загрузка батчей - загружаем только первые max_batches_to_load для экономии памяти
+            max_batches_to_load = min(len(batches), 64)  # Ограничиваем количество загружаемых батчей
+            
             if hasattr(self.participant, 'batch_sources') and job_id in self.participant.batch_sources:
                 batch_sources = self.participant.batch_sources[job_id]
                 logger.info(f"Found batch sources for job {job_id}: {len(batch_sources)} mappings")
                 
+                batches_requested = 0
                 for batch_info in batches:
+                    if batches_requested >= max_batches_to_load:
+                        logger.info(f"Requested maximum {max_batches_to_load} batches to conserve memory")
+                        break
+                        
                     batch_num = batch_info.get('batch_number', 0)
                     batch_key = f"{job_id}_batch_{batch_num}"
                     
@@ -178,26 +186,47 @@ class ProcNode:
                                     self.participant.local_batches = {}
                                 self.participant.local_batches[batch_key] = batch_data
                                 logger.info(f"Received batch {batch_num} successfully")
+                                batches_requested += 1
                         else:
                             logger.warning(f"Batch {batch_num} not found in batch_sources")
+                    else:
+                        batches_requested += 1  # Уже в кэше, считаем как загруженный
             
-            # Сбор данных из локальных батчей
+            # Сбор данных из локальных батчей - обрабатываем только первые несколько батчей для экономии памяти
             local_batches = getattr(self.participant, 'local_batches', {})
-            for batch_key, batch_data in local_batches.items():
-                if batch_key.startswith(f"{job_id}_batch_") and batch_key not in incorporated_batches:
+            batches_loaded = 0
+            
+            # Сортируем ключи для детерминированного порядка загрузки
+            sorted_batch_keys = sorted([k for k in local_batches.keys() if k.startswith(f"{job_id}_batch_")])
+            
+            for batch_key in sorted_batch_keys:
+                if batches_loaded >= max_batches_to_load:
+                    logger.info(f"Loaded maximum {max_batches_to_load} batches to conserve memory")
+                    break
+                    
+                batch_data = local_batches[batch_key]
+                if batch_key not in incorporated_batches:
                     batch_num = int(batch_key.split('_')[-1])
                     incorporated_batches.add(batch_key)
                     
                     # Используем input_ids
                     seqs = batch_data.get("input_ids", [])
                     masks = batch_data.get("attention_mask", [])
+                    # Получаем метки из батча (теперь они сохраняются в prep.py)
+                    labels_from_batch = batch_data.get("labels", None)
                     
                     all_sequences.extend(seqs)
                     all_masks.extend(masks)
-                    # Предполагаем, что метки 0, если их нет в данных (заглушка для примера)
-                    # В реальном сценарии метки должны приходить с данными
-                    all_labels.extend([0] * len(seqs))
-                    logger.info(f"Added batch {batch_num} to training data ({len(seqs)} samples)")
+                    
+                    if labels_from_batch is not None:
+                        all_labels.extend(labels_from_batch)
+                        logger.info(f"Added batch {batch_num} to training data ({len(seqs)} samples) with labels")
+                    else:
+                        # Fallback: предполагаем бинарную классификацию с меткой 0
+                        all_labels.extend([0] * len(seqs))
+                        logger.warning(f"Added batch {batch_num} without labels - using default label 0")
+                    
+                    batches_loaded += 1
             
             if not all_sequences:
                 logger.error("No data available for training after loading batches")
@@ -224,18 +253,23 @@ class ProcNode:
 
             dataset = FederatedDataset(all_sequences, all_masks, all_labels)
             
-            # Уменьшаем размер батча для экономии памяти
-            effective_batch_size = min(batch_size, 16) 
+            # Уменьшаем размер батча для экономии памяти (особенно важно для GPU с 8GB VRAM)
+            effective_batch_size = min(batch_size, 8) 
             dataloader = DataLoader(dataset, batch_size=effective_batch_size, shuffle=True, num_workers=0)
 
             logger.info(f"Starting training loop: {len(dataloader)} steps per epoch, batch_size={effective_batch_size}")
             
             # Освобождаем память перед началом обучения
-            import gc
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 model.cuda() # Перемещаем модель на GPU
+            
+            # Очищаем локальные списки данных после создания dataloader для экономии памяти
+            del all_sequences, all_masks, all_labels, dataset
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # Training loop
             total_loss = 0
@@ -252,7 +286,7 @@ class ProcNode:
                     if not self.training_active:
                         break
 
-                    # Переносим только текущий мини-батч на GPU
+                    # Переносим только текущий мини-батч на GPU и освобождаем память после
                     input_ids = batch['input_ids'].to('cuda')
                     attention_mask = batch['attention_mask'].to('cuda')
                     labels = batch['labels'].to('cuda')
@@ -272,6 +306,11 @@ class ProcNode:
                     epoch_loss += loss.item()
                     steps_count += 1
                     
+                    # Освобождаем память после каждого батча
+                    del input_ids, attention_mask, labels, outputs, loss
+                    if torch.cuda.is_available() and batch_idx % 10 == 0:
+                        torch.cuda.empty_cache()
+                    
                     if steps_count % 50 == 0:
                         logger.info(f"  Epoch {epoch+1}/{epochs}, Step {steps_count}: Loss {loss.item():.4f}")
 
@@ -279,6 +318,11 @@ class ProcNode:
                     avg_epoch_loss = epoch_loss / steps_count
                     total_loss += avg_epoch_loss
                     logger.info(f"  Epoch {epoch+1}/{epochs} completed - Avg Loss: {avg_epoch_loss:.4f}")
+                    
+                    # Очищаем память после каждой эпохи
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 else:
                     logger.warning(f"  Epoch {epoch+1} had no steps!")
 
@@ -299,6 +343,17 @@ class ProcNode:
             
             # Send weights to coordinator for aggregation
             self.participant._send_model_update(job_id, round_num, weights, final_loss)
+            
+            # Очищаем local_batches после завершения обучения для экономии памяти
+            if hasattr(self.participant, 'local_batches'):
+                # Удаляем только батчи этого job_id
+                keys_to_delete = [k for k in self.participant.local_batches.keys() if k.startswith(f"{job_id}_batch_")]
+                for key in keys_to_delete:
+                    del self.participant.local_batches[key]
+                logger.info(f"Cleaned up {len(keys_to_delete)} batches for job {job_id}")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
         except Exception as e:
             logger.error(f"PROC training error: {e}")
