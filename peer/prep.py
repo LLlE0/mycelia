@@ -177,10 +177,24 @@ class PrepNode:
                         batch_embeddings = embeddings[0]
                 
                 batch_key = f"{job_id}_batch_{batch_num}"
+                
+                # Extract labels if available in dataset
+                batch_labels = []
+                if 'label' in dataset.columns:
+                    batch_labels = dataset['label'].iloc[start_idx:end_idx].tolist()
+                elif 'labels' in dataset.columns:
+                    batch_labels = dataset['labels'].iloc[start_idx:end_idx].tolist()
+                elif 'target' in dataset.columns:
+                    batch_labels = dataset['target'].iloc[start_idx:end_idx].tolist()
+                else:
+                    # Default to 0 if no labels found
+                    batch_labels = [0] * (end_idx - start_idx)
+                
                 stored_data = {
                     "embeddings": batch_embeddings.cpu().tolist(),
                     "attention_mask": batch_attention_mask.cpu().tolist(),
                     "input_ids": batch_input_ids.cpu().tolist(),
+                    "labels": batch_labels,
                 }
                 self._store_batch_locally(batch_key, stored_data)
                 
