@@ -1,6 +1,7 @@
 """
 PREP (Preprocessing) node functionality for P2P Network with Federated Learning
 Handles data preprocessing: loading datasets, tokenizing, encoding, and storing batches locally
+Строго однопоточная обработка внутри задачи. Без внутренней многопоточности.
 """
 
 import json
@@ -18,7 +19,6 @@ logger = logging.getLogger(__name__)
 class PrepNode:
     """PREP node handles dataset preprocessing and batch storage"""
     
-    # Available encoders
     ENCODERS = {
         "bert": "bert-base-uncased",
         "roberta": "roberta-base",
@@ -26,7 +26,6 @@ class PrepNode:
         "sentence-transformer": "paraphrase-multilingual-MiniLM-L12-v2",
     }
     
-    # 🔹 Расширенный список возможных имён колонок с метками
     LABEL_COLUMNS = ['label', 'labels', 'target', 'targets', 'class', 'classes', 
                      'y', 'category', 'sentiment', 'score', 'rating', 'outcome']
     
@@ -61,10 +60,8 @@ class PrepNode:
             time.sleep(self.poll_interval)
 
     def _poll_for_task(self):
-        """Poll coordinator for preprocessing tasks"""
         if not self.participant.ws or not self.participant.connected:
             return
-        
         try:
             self.participant.ws.send(json.dumps({
                 "type": "poll",
@@ -140,12 +137,10 @@ class PrepNode:
             total_records = len(dataset)
             logger.info(f"  Loaded {total_records} records")
             
-            # 🔹 ОТЛАДКА: Выводим все колонки датасета
             logger.info(f"  Dataset columns: {list(dataset.columns)}")
             if len(dataset) > 0:
                 logger.info(f"  Dataset sample (first row): {dataset.iloc[0].to_dict()}")
             
-            # 🔹 Поиск колонки с метками
             label_column = self._find_label_column(dataset)
             logger.info(f"  Label column found: {label_column}")
             
@@ -204,10 +199,8 @@ class PrepNode:
                 
                 batch_key = f"{job_id}_batch_{batch_num}"
                 
-                # 🔹 Извлечение меток через универсальный метод
                 batch_labels = self._extract_labels(dataset, label_column, start_idx, end_idx)
                 
-                # 🔹 Отладка: первые метки батча
                 if i == 0:
                     logger.info(f"  First batch labels sample: {batch_labels[:10]}")
                     unique = list(set(batch_labels))
@@ -226,8 +219,6 @@ class PrepNode:
                 logger.info(f"  Batch {batch_num} ready ({progress:.1f}%)")
             
             logger.info(f"PREP: Completed preprocessing for job {job_id}")
-            
-            # 🔹 После завершения — сразу поллим координатор на новые задачи!
             self._poll_for_task()
             
         except Exception as e:
@@ -243,27 +234,22 @@ class PrepNode:
                 }))
     
     def _find_label_column(self, dataset):
-        """Находит колонку с метками в датасете"""
-        # 🔹 Сначала проверяем известные имена — берём без фильтра по уникальным значениям!
         for col in self.LABEL_COLUMNS:
             if col in dataset.columns:
                 unique_vals = dataset[col].dropna().unique()
                 logger.info(f"  Found label column '{col}' with {len(unique_vals)} unique values: {sorted(unique_vals)[:10]}...")
                 return col
         
-        # 🔹 Эвристика для неизвестных имён: ищем числовые колонки с дискретными значениями
         numeric_cols = dataset.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
         for col in numeric_cols:
             if col.lower() not in ['id', 'index', 'idx', 'count', 'len', 'row_idx']:
                 unique_vals = dataset[col].dropna().unique()
-                if 1 < len(unique_vals) <= 500:  # Увеличили лимит для гибкости
+                if 1 < len(unique_vals) <= 500:
                     logger.info(f"  Guessed label column: {col} (unique values: {len(unique_vals)}, sample: {unique_vals[:10]})")
                     return col
-        
         return None
     
     def _extract_labels(self, dataset, label_column, start_idx, end_idx):
-        """Извлекает метки из датасета"""
         if label_column and label_column in dataset.columns:
             labels = dataset[label_column].iloc[start_idx:end_idx].tolist()
             return [int(l) if isinstance(l, (int, float, str)) and str(l).isdigit() else l for l in labels]
@@ -298,19 +284,19 @@ class PrepNode:
     
     def _load_huggingface_rows(self, dataset_path, offset=0, length=100):
         """
-        Загружает строки из HuggingFace Datasets Server API с пагинацией.
-        🔹 Защита от 429: задержки между запросами + автоматический повтор.
+        Загружает строки из HF API строго последовательно.
+        Устойчив к 429, сетевым ошибкам. Позволяет продолжить с частичными данными.
         """
         MAX_PER_REQUEST = 100
-        REQUEST_DELAY = 1.5        # Задержка между успешными запросами (сек)
-        RATE_LIMIT_WAIT = 10.0     # Задержка при получении 429 (сек)
-        MAX_RETRIES = 2            # Максимум повторов при ошибке сети
+        REQUEST_DELAY = 2.0        # Пауза между успешными запросами
+        RATE_LIMIT_WAIT = 15.0     # Пауза при 429
+        MAX_RETRIES = 3            # Максимум повторов на чанк
 
         all_rows = []
         remaining = length
         current_offset = offset
 
-        logger.info(f"Loading HF  offset={offset}, length={length} (paginated, max {MAX_PER_REQUEST}/req)")
+        logger.info(f"Loading HF data: offset={offset}, length={length} (sequential, max {MAX_PER_REQUEST}/req)")
 
         while remaining > 0:
             batch_size = min(remaining, MAX_PER_REQUEST)
@@ -324,23 +310,29 @@ class PrepNode:
             )
 
             success = False
+            rows = []
+            
             for attempt in range(MAX_RETRIES + 1):
                 try:
-                    resp = requests.get(rows_url, timeout=30)
-                    
-                    # 🔹 Обработка 429 Too Many Requests
+                    resp = requests.get(rows_url, timeout=45)
+
                     if resp.status_code == 429:
                         wait = RATE_LIMIT_WAIT * (attempt + 1)
                         logger.warning(f"⏳ Rate limit (429). Waiting {wait}s before retry {attempt+1}/{MAX_RETRIES+1}...")
                         time.sleep(wait)
                         continue
-                    
+
+                    if resp.status_code in (400, 404):
+                        logger.warning(f"Dataset config/split not found or invalid at offset {current_offset}. Stopping.")
+                        success = True
+                        break
+
                     resp.raise_for_status()
                     data = resp.json()
                     rows = data.get("rows", [])
                     success = True
                     break
-                    
+
                 except requests.RequestException as e:
                     logger.error(f"Network error at offset {current_offset}: {e}")
                     if attempt < MAX_RETRIES:
@@ -348,33 +340,32 @@ class PrepNode:
                         logger.warning(f"Retrying in {wait}s...")
                         time.sleep(wait)
                     else:
-                        raise
+                        logger.error(f"Max retries reached for offset {current_offset}")
+                        success = False
 
             if not success:
-                logger.error(f"Failed to load batch at offset {current_offset} after {MAX_RETRIES} retries")
+                logger.warning(f"⚠️ Failed to fetch data at offset {current_offset}. Stopping pagination.")
                 break
 
             if not rows:
-                logger.warning(f"No more rows at offset {current_offset}, stopping pagination")
+                logger.info(f"No more rows at offset {current_offset}. Dataset may be exhausted.")
                 break
 
-            # Извлекаем только данные строки
             for row in rows:
                 all_rows.append(row["row"])
 
             loaded = len(rows)
             remaining -= loaded
             current_offset += loaded
-            logger.debug(f"  Loaded {loaded} rows (offset {current_offset - loaded}), remaining: {remaining}")
+            logger.debug(f"  Loaded {loaded} rows (total: {len(all_rows)}), next offset: {current_offset}")
 
-            # 🔹 Задержка перед следующим запросом, чтобы не получить 429
             if remaining > 0:
                 time.sleep(REQUEST_DELAY)
 
         if not all_rows:
-            raise ValueError(f"No data loaded from HF dataset '{dataset_path}' at offset {offset}")
+            raise ValueError(f"No data could be loaded from HF dataset '{dataset_path}'. Check name/config/split or network.")
 
-        logger.info(f"Total loaded: {len(all_rows)} rows from HF API")
+        logger.info(f"✅ Successfully loaded {len(all_rows)} rows from HF API (requested {length})")
         return pd.DataFrame(all_rows)
     
     def _load_huggingface_dataset(self, url, dataset_type, offset=0, length=100):
@@ -425,18 +416,13 @@ class PrepNode:
         return tokenizer
     
     def _get_encoder(self, encoder_name):
-        """Get encoder model - cached to avoid reloading"""
         if encoder_name in self._encoder_cache:
             return self._encoder_cache[encoder_name]
         
         warnings.filterwarnings('ignore')
         from transformers import AutoModel
         
-        if encoder_name in self.ENCODERS:
-            model_name = self.ENCODERS[encoder_name]
-        else:
-            model_name = encoder_name
-        
+        model_name = self.ENCODERS.get(encoder_name, encoder_name)
         logger.info(f"Loading encoder model: {model_name}")
         encoder = AutoModel.from_pretrained(model_name)
         encoder.eval()
