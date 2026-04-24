@@ -129,13 +129,13 @@ class ProcNode:
             if is_first_round:
                 logger.info("  Initializing model from scratch")
                 self.local_model = AutoModelForSequenceClassification.from_pretrained(
-                    model_name, num_labels=2
+                    model_name, num_labels=151
                 )
             else:
                 logger.info("  Loading global weights from coordinator")
                 if self.local_model is None:
                     self.local_model = AutoModelForSequenceClassification.from_pretrained(
-                        model_name, num_labels=2
+                        model_name, num_labels=151
                     )
             
             model = self.local_model
