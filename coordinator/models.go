@@ -123,6 +123,8 @@ type PendingTask struct {
 	Role       string                 `bson:"role" json:"role"`           // PREP, PROC
 	Status     string                 `bson:"status" json:"status"`       // pending, assigned, completed
 	AssignedTo string                 `bson:"assigned_to" json:"assigned_to"`
+	Retries    int                    `bson:"retries" json:"retries"`
+	MaxRetries int                    `bson:"max_retries" json:"max_retries"`
 	Data       map[string]interface{} `bson:"data" json:"data"`
 	CreatedAt  time.Time              `bson:"created_at" json:"created_at"`
 	UpdatedAt  time.Time              `bson:"updated_at" json:"updated_at"`

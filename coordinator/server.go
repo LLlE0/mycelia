@@ -634,44 +634,6 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 				"batch_number": batchNum,
 				"request_from": from,
 			})
-		} else if msgType == "task_completed" {
-			// Handle task completion from PREP/PROC nodes
-			taskID, _ := msgData["task_id"].(string)
-			from, _ := msgData["from"].(string)
-			jobID, _ := msgData["job_id"].(string)
-
-			log.Printf("Task %s completed by %s", taskID, from)
-
-			// Update preprocessing task status
-			err := s.db.UpdatePreprocessingTaskByTaskID(taskID, bson.M{"status": "completed"})
-			if err != nil {
-				log.Printf("Failed to update preprocessing task %s: %v", taskID, err)
-			}
-
-			// If this is a PREP node task completion, check if all batches are ready
-			if jobID != "" {
-				job, err := s.db.GetTrainingJobByID(jobID)
-				if err == nil && job != nil && job.Status == "preprocessing" {
-					ready := 0
-					batches, _ := s.db.GetBatchesByJob(jobID)
-					for _, b := range batches {
-						if b.Status == "ready" || b.Status == "training" {
-							ready++
-						}
-					}
-					// Calculate actual total batches based on dataset size and batch size (ceiling division)
-					actualTotalBatches := job.TotalBatches
-					if job.DatasetSize > 0 && job.BatchSize > 0 {
-						actualTotalBatches = (job.DatasetSize + job.BatchSize - 1) / job.BatchSize
-					}
-					if ready >= actualTotalBatches {
-						prepProgress := float64(ready) / float64(actualTotalBatches) * 100
-						log.Printf("All %d batches ready (%.1f%%), starting training round for job %s (triggered by task_completed)", ready, prepProgress, jobID)
-						s.startTrainingRound(jobID)
-					}
-				}
-			}
-
 		} else if msgType == "task_error" {
 			// Handle task error from PREP/PROC nodes
 			taskID, _ := msgData["task_id"].(string)
@@ -680,8 +642,27 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 
 			log.Printf("Task %s failed by %s: %s", taskID, from, errorMsg)
 
-			// Update preprocessing task status to failed
-			err := s.db.UpdatePreprocessingTaskByTaskID(taskID, bson.M{"status": "failed"})
+			// Reset pending task to allow retry by another node
+			pendingTask, err := s.db.GetPendingTaskByID(taskID)
+			if err == nil && pendingTask != nil {
+				retries := pendingTask.Retries + 1
+				maxRetries := pendingTask.MaxRetries
+				if maxRetries == 0 {
+					maxRetries = 3
+				}
+				if retries > maxRetries {
+					s.db.UpdatePendingTask(taskID, bson.M{"status": "failed", "retries": retries})
+					log.Printf("Task %s exceeded max retries (%d), marked as failed permanently", taskID, maxRetries)
+				} else {
+					s.db.UpdatePendingTask(taskID, bson.M{"status": "pending", "assigned_to": "", "retries": retries})
+					log.Printf("Task %s failed by %s, reset to pending (retry %d/%d)", taskID, from, retries, maxRetries)
+				}
+			} else {
+				log.Printf("Could not find pending task %s to update on error: %v", taskID, err)
+			}
+
+			// Also update preprocessing task status if it exists
+			err = s.db.UpdatePreprocessingTaskByTaskID(taskID, bson.M{"status": "failed"})
 			if err != nil {
 				log.Printf("Failed to update preprocessing task %s: %v", taskID, err)
 			}
@@ -1395,11 +1376,12 @@ func (s *Server) startTrainingJob(id string) {
 
 		// Save pending task to database for polling
 		pendingTask := &PendingTask{
-			JobID:    id,
-			JobName:  job.Name,
-			TaskType: "preprocess",
-			Role:     "PREP",
-			Status:   "pending",
+			JobID:      id,
+			JobName:    job.Name,
+			TaskType:   "preprocess",
+			Role:       "PREP",
+			Status:     "pending",
+			MaxRetries: 3,
 			Data: map[string]interface{}{
 				"job_id":          id,
 				"dataset_url":     job.DatasetURL,
@@ -1524,6 +1506,17 @@ func (s *Server) handlePrepNodeDisconnect(nodeName string) {
 		})
 
 		log.Printf("Reassigned batches %d-%d to new PREP node %s", startBatch, endBatch, newNode)
+	}
+
+	// Reset any assigned pending tasks for the disconnected node so other nodes can pick them up
+	assignedTasks, err := s.db.GetAssignedPendingTasks("PREP", nodeName)
+	if err != nil {
+		log.Printf("Error getting assigned pending tasks for %s: %v", nodeName, err)
+	} else {
+		for _, task := range assignedTasks {
+			s.db.UpdatePendingTask(task.ID.Hex(), bson.M{"status": "pending", "assigned_to": ""})
+			log.Printf("Reset pending task %s to pending due to PREP node %s disconnect", task.ID.Hex(), nodeName)
+		}
 	}
 }
 
@@ -1702,7 +1695,7 @@ func (s *Server) handleBatchProgress(c *gin.Context) {
 	// Check if all batches are ready
 	_, ready, _ := s.db.GetBatchStats(batch.JobID)
 	job, _ := s.db.GetTrainingJobByID(batch.JobID)
-	log.Printf("handleBatchProgress: job=%s, total_batches=%d, ready_batches=%d, status=%s", 
+	log.Printf("handleBatchProgress: job=%s, total_batches=%d, ready_batches=%d, status=%s",
 		batch.JobID, job.TotalBatches, ready, job.Status)
 	if job != nil && ready >= job.TotalBatches && job.Status == "preprocessing" {
 		log.Printf("=== ALL BATCHES READY: %d/%d, starting training ===", ready, job.TotalBatches)

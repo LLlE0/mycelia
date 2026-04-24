@@ -638,6 +638,31 @@ func (d *Database) GetPendingTasksByRole(role string) ([]PendingTask, error) {
 	return tasks, nil
 }
 
+func (d *Database) GetAssignedPendingTasks(role, assignedTo string) ([]PendingTask, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	filter := bson.M{
+		"status":      "assigned",
+		"assigned_to": assignedTo,
+	}
+	if role != "" {
+		filter["role"] = role
+	}
+
+	cursor, err := d.pendingTaskCollection.Find(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var tasks []PendingTask
+	if err := cursor.All(ctx, &tasks); err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
 func (d *Database) GetPendingTaskByID(id string) (*PendingTask, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

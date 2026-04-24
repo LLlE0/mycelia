@@ -1,20 +1,13 @@
 # Distributed ML Diploma Project TODO
 
-## Current Task: Fix Training Tasks Not Created/Assigned
+## Current Task: Reassign failed PREP tasks to other PREP nodes
 
 ### Breakdown of Approved Plan
-✅ **Step 1**: Create TODO.md - DONE  
-✅ **Step 2**: Enable WS polling in peer/proc.py - DONE  
-✅ **Step 3**: Relaxed trigger in coordinator/server.go batch_progress - DONE  
-✅ **Step 4**: Fixed WS poll handler - now supports role=="PROC" (GetPendingTasksByRole("PROC")) - DONE
-
-**Test**:
-- Rebuild coordinator: `cd coordinator && go build -o bin/coordinator`
-- Run nodes, create job → PREP processes → batches ready → "starting training round" log → PROC polls → "Assigned task TRAIN to PROC" → executes.
-
-Progress: 4/5 complete. PROC now receives train tasks from PendingTasks!
-
-**Final verification**: Check logs/DB after PREP completes.
-
-
+- [ ] **Step 1**: Add `Retries`/`MaxRetries` fields to `PendingTask` in `coordinator/models.go`
+- [ ] **Step 2**: Add `GetAssignedPendingTasks` DB helper in `coordinator/database.go`
+- [ ] **Step 3**: Update `task_error` handler in `coordinator/server.go` to reset failed tasks to `pending` (with retry limit)
+- [ ] **Step 4**: Update `handlePrepNodeDisconnect` in `coordinator/server.go` to reset assigned tasks on disconnect
+- [ ] **Step 5**: Remove dead (unreachable) second `task_completed` block in WebSocket handler
+- [ ] **Step 6**: Set `MaxRetries: 3` when creating PREP `PendingTask` in `startTrainingJob`
+- [ ] **Step 7**: Build coordinator and verify compilation
 
