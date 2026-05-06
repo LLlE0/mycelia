@@ -36,7 +36,7 @@ def register_task(task_name):
 
 
 class Participant:
-    def __init__(self, coordinator_url: str, role: str = None):
+    def __init__(self, coordinator_url: str, role: str = None, hf_key: str = None):
         self.coordinator_url = coordinator_url.rstrip('/')
         self.role = role  # PREP or PROC - set by coordinator
         self.data_dir = "./data"
@@ -45,6 +45,7 @@ class Participant:
         self.connected = False
         self.running = True
         self.training_active = False  # For federated training
+        self.hf_key = hf_key or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
         
         # Task queue for running heavy ML tasks in separate thread (keeps WebSocket responsive for ping/pong)
         self.task_queue = queue.Queue()
@@ -693,6 +694,11 @@ class Participant:
             except Exception as e:
                 print(f"Error: {e}")
         self.running = False
+        try:
+            if self.prep_node:
+                self.prep_node.stop_worker()
+        except Exception:
+            pass
         logger.info("Stopped")
 
 
@@ -705,9 +711,12 @@ def main():
     parser.add_argument('-r', '--role', 
                         default=None,
                         help='Force role (PREP or PROC)')
+    parser.add_argument('--key',
+                        default=None,
+                        help='HuggingFace API token (or set HF_TOKEN / HUGGINGFACE_TOKEN env)')
     args = parser.parse_args()
     
-    p = Participant(args.coordinator, args.role)
+    p = Participant(args.coordinator, args.role, hf_key=args.key)
     
     logger.info("===========================================")
     logger.info(f"Node: {p.name}")

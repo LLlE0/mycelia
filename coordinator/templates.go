@@ -2,7 +2,54 @@ package coordinator
 
 import "html/template"
 
-var htmlTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
+var htmlTemplate = template.Must(template.New("base").Parse(`
+{{define "login"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin login</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { padding: 20px; background-color: #f8f9fa; }
+        .container { max-width: 520px; }
+        .card { margin-top: 60px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Admin login</h5>
+            </div>
+            <div class="card-body">
+                {{if .Error}}
+                <div class="alert alert-danger">{{.Error}}</div>
+                {{end}}
+                <form method="POST" action="/login">
+                    <div class="mb-3">
+                        <label class="form-label">Login</label>
+                        <input class="form-control" name="login" autocomplete="username" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Password</label>
+                        <input type="password" class="form-control" name="password" autocomplete="current-password" required>
+                    </div>
+                    <button class="btn btn-primary w-100" type="submit">Sign in</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+{{end}}
+
+{{define "participants"}}{{template "index" .}}{{end}}
+{{define "messages"}}{{template "index" .}}{{end}}
+
+{{define "index"}}
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -488,4 +535,6 @@ var htmlTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
         }
     </script>
 </body>
-</html>`))
+</html>
+{{end}}
+`))

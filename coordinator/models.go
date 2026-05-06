@@ -28,6 +28,21 @@ type Message struct {
 	Timestamp time.Time          `bson:"timestamp" json:"timestamp"`
 }
 
+// Credential represents an admin credential record
+// Collection: credentials
+//
+// Supported formats:
+// - { "login": "...", "password_hash": "<bcrypt>" }
+// - { "login": "...", "password": "<plain>" } (compat)
+type Credential struct {
+	ID           primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Login        string             `bson:"login" json:"login"`
+	PasswordHash string             `bson:"password_hash,omitempty" json:"password_hash,omitempty"`
+	Password     string             `bson:"password,omitempty" json:"password,omitempty"`
+	CreatedAt    time.Time          `bson:"created_at,omitempty" json:"created_at,omitempty"`
+	UpdatedAt    time.Time          `bson:"updated_at,omitempty" json:"updated_at,omitempty"`
+}
+
 // TrainingJob represents a federated learning training job
 type TrainingJob struct {
 	ID              primitive.ObjectID `bson:"_id,omitempty" json:"id"`

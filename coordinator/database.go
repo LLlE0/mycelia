@@ -21,6 +21,7 @@ type Database struct {
 	updateCollection            *mongo.Collection
 	roundCollection             *mongo.Collection
 	preprocessingTaskCollection *mongo.Collection
+	credentialsCollection       *mongo.Collection
 }
 
 func NewDatabase(uri, dbName string) (*Database, error) {
@@ -48,7 +49,20 @@ func NewDatabase(uri, dbName string) (*Database, error) {
 		updateCollection:            db.Collection("model_updates"),
 		roundCollection:             db.Collection("training_rounds"),
 		preprocessingTaskCollection: db.Collection("preprocessing_tasks"),
+		credentialsCollection:       db.Collection("credentials"),
 	}, nil
+}
+
+func (d *Database) GetCredentialByLogin(login string) (*Credential, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var cred Credential
+	err := d.credentialsCollection.FindOne(ctx, bson.M{"login": login}).Decode(&cred)
+	if err != nil {
+		return nil, err
+	}
+	return &cred, nil
 }
 
 func (d *Database) AddParticipant(p *Participant) error {

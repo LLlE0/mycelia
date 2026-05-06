@@ -12,6 +12,7 @@ import threading
 import time
 import requests
 import torch
+import queue
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,36 @@ class PrepNode:
         self.active_tasks = {}
         self.poll_interval = 5
         self._encoder_cache = {}
+        self._task_queue = queue.Queue()
+        self._worker_thread = None
+        self._worker_running = True
+        self._start_worker()
+
+    def _start_worker(self):
+        if self._worker_thread and self._worker_thread.is_alive():
+            return
+
+        def worker():
+            logger.info("PREP worker started (single-thread)")
+            while self._worker_running and self.participant.running:
+                try:
+                    item = self._task_queue.get(timeout=1)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    break
+
+                task_id, task_data = item
+                try:
+                    # Mark as running for observability
+                    self.active_tasks[task_id] = "running"
+                    self._process_task(task_id, task_data)
+                finally:
+                    self._task_queue.task_done()
+            logger.info("PREP worker stopped")
+
+        self._worker_thread = threading.Thread(target=worker, daemon=True)
+        self._worker_thread.start()
 
     def start_polling(self):
         if self.polling_active:
@@ -50,6 +81,15 @@ class PrepNode:
         if self.polling_thread and self.polling_thread.is_alive():
             self.polling_thread.join(timeout=5)
         logger.info("Stopped polling for preprocessing tasks")
+
+    def stop_worker(self):
+        self._worker_running = False
+        try:
+            self._task_queue.put_nowait(None)
+        except Exception:
+            pass
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=5)
 
     def _poll_loop(self):
         while self.polling_active and self.participant.running:
@@ -311,10 +351,13 @@ class PrepNode:
 
             success = False
             rows = []
+            headers = {}
+            if getattr(self.participant, "hf_key", None):
+                headers["Authorization"] = f"Bearer {self.participant.hf_key}"
             
             for attempt in range(MAX_RETRIES + 1):
                 try:
-                    resp = requests.get(rows_url, timeout=45)
+                    resp = requests.get(rows_url, timeout=45, headers=headers)
 
                     if resp.status_code == 429:
                         wait = RATE_LIMIT_WAIT * (attempt + 1)
@@ -439,13 +482,9 @@ class PrepNode:
         task_id = data.get("id")
         task_data = data.get("data")
         logger.info(f"Received assigned task {task_id}")
-        task_thread = threading.Thread(
-            target=self._process_task,
-            args=(task_id, task_data),
-            daemon=True
-        )
-        self.active_tasks[task_id] = task_thread
-        task_thread.start()
+        # Single-threaded: enqueue and process sequentially
+        self.active_tasks[task_id] = "queued"
+        self._task_queue.put((task_id, task_data))
 
     def handle_send_batch(self, data):
         job_id = data.get("job_id")

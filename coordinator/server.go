@@ -1,7 +1,11 @@
 package coordinator
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
@@ -16,6 +20,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type Server struct {
@@ -31,6 +37,11 @@ type Server struct {
 	relayServer   *RelayServer
 	relayListener net.Listener
 	relayPort     int
+}
+
+type adminSession struct {
+	Login string `json:"login"`
+	Exp   int64  `json:"exp"`
 }
 
 type CoordinatorInfo struct {
@@ -248,10 +259,16 @@ func (s *Server) Start() error {
 	// Set up template
 	r.SetHTMLTemplate(htmlTemplate)
 
-	// HTTP routes
-	r.GET("/", s.handleIndex)
-	r.GET("/participants", s.handleParticipants)
-	r.GET("/messages", s.handleMessages)
+	// Auth routes
+	r.GET("/login", s.handleLoginGet)
+	r.POST("/login", s.handleLoginPost)
+	r.GET("/logout", s.handleLogout)
+
+	// Admin panel routes (protected)
+	admin := r.Group("/", s.requireAdmin())
+	admin.GET("/", s.handleIndex)
+	admin.GET("/participants", s.handleParticipants)
+	admin.GET("/messages", s.handleMessages)
 	r.GET("/ws", s.handleWebSocket)
 	r.GET("/coordinator", s.handleCoordinatorInfo)
 
@@ -260,10 +277,11 @@ func (s *Server) Start() error {
 	r.GET("/api/participants", s.handleAPIParticipants)
 	r.POST("/api/participant/update", s.handleUpdateParticipant)
 	r.GET("/api/participant/:name", s.handleAPIGetParticipant)
-	r.DELETE("/api/participant/:name", s.handleAPIDeleteParticipant)
+	// Destructive admin-only API
+	admin.DELETE("/api/participant/:name", s.handleAPIDeleteParticipant)
 	r.POST("/api/message", s.handleAPISendMessage)
 	r.GET("/api/ping/:name", s.handleAPIPing)
-	r.POST("/api/command", s.handleCommand)
+	admin.POST("/api/command", s.handleCommand)
 
 	// Task API routes
 	r.POST("/api/task", s.handleCreateTask)
@@ -309,6 +327,123 @@ func (s *Server) Start() error {
 
 	log.Printf("Coordinator server starting on %s", s.addr)
 	return r.Run(s.addr)
+}
+
+func (s *Server) sessionSecret() []byte {
+	secret := os.Getenv("ADMIN_SESSION_SECRET")
+	if secret == "" {
+		secret = "dev-secret-change-me"
+	}
+	return []byte(secret)
+}
+
+func (s *Server) sign(data []byte) string {
+	mac := hmac.New(sha256.New, s.sessionSecret())
+	_, _ = mac.Write(data)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (s *Server) setAdminSessionCookie(c *gin.Context, login string) {
+	sess := adminSession{
+		Login: login,
+		Exp:   time.Now().Add(24 * time.Hour).Unix(),
+	}
+	raw, _ := json.Marshal(sess)
+	payload := base64.RawURLEncoding.EncodeToString(raw)
+	sig := s.sign([]byte(payload))
+	value := payload + "." + sig
+	// secure=false by default because deployments vary; can be reversed behind TLS terminator
+	c.SetCookie("admin_session", value, 24*3600, "/", "", false, true)
+}
+
+func (s *Server) clearAdminSessionCookie(c *gin.Context) {
+	c.SetCookie("admin_session", "", -1, "/", "", false, true)
+}
+
+func (s *Server) parseAdminSessionCookie(c *gin.Context) (*adminSession, bool) {
+	val, err := c.Cookie("admin_session")
+	if err != nil || val == "" {
+		return nil, false
+	}
+	parts := strings.Split(val, ".")
+	if len(parts) != 2 {
+		return nil, false
+	}
+	payload, sig := parts[0], parts[1]
+	expected := s.sign([]byte(payload))
+	if !hmac.Equal([]byte(expected), []byte(sig)) {
+		return nil, false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		return nil, false
+	}
+	var sess adminSession
+	if err := json.Unmarshal(raw, &sess); err != nil {
+		return nil, false
+	}
+	if sess.Exp <= time.Now().Unix() || sess.Login == "" {
+		return nil, false
+	}
+	return &sess, true
+}
+
+func (s *Server) requireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if _, ok := s.parseAdminSessionCookie(c); ok {
+			c.Next()
+			return
+		}
+		c.Redirect(http.StatusFound, "/login")
+		c.Abort()
+	}
+}
+
+func (s *Server) handleLoginGet(c *gin.Context) {
+	c.HTML(http.StatusOK, "login", gin.H{})
+}
+
+func (s *Server) handleLoginPost(c *gin.Context) {
+	login := strings.TrimSpace(c.PostForm("login"))
+	password := c.PostForm("password")
+	if login == "" || password == "" {
+		c.HTML(http.StatusUnauthorized, "login", gin.H{"Error": "invalid credentials"})
+		return
+	}
+
+	cred, err := s.db.GetCredentialByLogin(login)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			c.HTML(http.StatusUnauthorized, "login", gin.H{"Error": "invalid credentials"})
+			return
+		}
+		c.HTML(http.StatusInternalServerError, "login", gin.H{"Error": "server error"})
+		return
+	}
+
+	ok := false
+	if cred.PasswordHash != "" {
+		if bcrypt.CompareHashAndPassword([]byte(cred.PasswordHash), []byte(password)) == nil {
+			ok = true
+		}
+	} else if cred.Password != "" {
+		if cred.Password == password {
+			ok = true
+		}
+	}
+
+	if !ok {
+		c.HTML(http.StatusUnauthorized, "login", gin.H{"Error": "invalid credentials"})
+		return
+	}
+
+	s.setAdminSessionCookie(c, cred.Login)
+	c.Redirect(http.StatusFound, "/")
+}
+
+func (s *Server) handleLogout(c *gin.Context) {
+	s.clearAdminSessionCookie(c)
+	c.Redirect(http.StatusFound, "/login")
 }
 
 func (s *Server) handleIndex(c *gin.Context) {
