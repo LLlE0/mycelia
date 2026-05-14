@@ -11,12 +11,10 @@ import (
 )
 
 func main() {
-	// MongoDB connection settings
 	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
 	dbName := getEnv("MONGO_DB", "p2p_network")
 	serverAddr := getEnv("SERVER_ADDR", ":8080")
 
-	// Initialize database
 	db, err := coordinator.NewDatabase(mongoURI, dbName)
 	if err != nil {
 		log.Fatalf("Failed to connect to MongoDB: %v", err)
@@ -25,10 +23,8 @@ func main() {
 
 	log.Println("Connected to MongoDB")
 
-	// Create and start server
 	server := coordinator.NewServer(db, serverAddr)
 
-	// Handle graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 

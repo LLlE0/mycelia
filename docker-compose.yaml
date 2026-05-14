@@ -9,7 +9,8 @@ services:
     volumes:
       - mongodb_data:/data/db
     environment:
-      MONGO_INITDB_DATABASE: p2p_network
+      - MONGO_INITDB_DATABASE=p2p_network
+      - GLIBC_TUNABLES=glibc.pthread.rseq=1
 
 volumes:
   mongodb_data:

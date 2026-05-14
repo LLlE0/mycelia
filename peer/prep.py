@@ -13,6 +13,9 @@ import time
 import requests
 import torch
 import queue
+import os
+import gzip
+import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +43,134 @@ class PrepNode:
         self._task_queue = queue.Queue()
         self._worker_thread = None
         self._worker_running = True
+        self._busy_task_id = None
         self._start_worker()
+
+    def _batches_root_dir(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base, "data", "batches")
+
+    def _cache_root_dir(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base, "data", "cache")
+
+    def dataset_id(self, dataset_url, dataset_type, model_name, encoder_name, batch_size):
+        key = f"{dataset_url}|{dataset_type}|{model_name}|{encoder_name}|{int(batch_size)}"
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    def _cache_batch_path(self, dataset_id, batch_num):
+        d = os.path.join(self._cache_root_dir(), str(dataset_id))
+        return os.path.join(d, f"batch_{int(batch_num)}.json.gz")
+
+    def get_cached_batch_data(self, dataset_id, batch_num):
+        path = self._cache_batch_path(dataset_id, batch_num)
+        if os.path.exists(path):
+            return self._read_gz_json(path)
+        return None
+
+    def _batch_file_path(self, job_id, batch_num):
+        job_dir = os.path.join(self._batches_root_dir(), str(job_id))
+        return os.path.join(job_dir, f"batch_{int(batch_num)}.json.gz")
+
+    def _ensure_job_dir(self, job_id):
+        job_dir = os.path.join(self._batches_root_dir(), str(job_id))
+        os.makedirs(job_dir, exist_ok=True)
+        return job_dir
+
+    def _write_gz_json_atomic(self, path, obj):
+        tmp = path + ".tmp"
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+
+    def _read_gz_json(self, path):
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _batch_signature(self, task_data, batch_num, record_count):
+        did = self.dataset_id(
+            task_data.get("dataset_url", ""),
+            task_data.get("dataset_type", "csv"),
+            task_data.get("model_name", ""),
+            task_data.get("encoder_name", ""),
+            int(task_data.get("batch_size", 0) or 0),
+        )
+        return {
+            "job_id": task_data.get("job_id"),
+            "dataset_url": task_data.get("dataset_url", ""),
+            "dataset_type": task_data.get("dataset_type", "csv"),
+            "batch_size": int(task_data.get("batch_size", 0) or 0),
+            "model_name": task_data.get("model_name", ""),
+            "encoder_name": task_data.get("encoder_name", ""),
+            "dataset_id": did,
+            "start_offset": int(task_data.get("start_offset", 0) or 0),
+            "end_offset": int(task_data.get("end_offset", 0) or 0),
+            "start_batch_num": int(task_data.get("start_batch_num", 0) or 0),
+            "batch_num": int(batch_num),
+            "record_count": int(record_count),
+            "created_at": time.time(),
+        }
+
+    def _stored_batch_is_compatible(self, stored, task_data, batch_num):
+        meta = stored.get("_meta", {}) if isinstance(stored, dict) else {}
+        if not isinstance(meta, dict):
+            return False
+        fields = [
+            "job_id",
+            "dataset_url",
+            "dataset_type",
+            "batch_size",
+            "model_name",
+            "encoder_name",
+            "start_offset",
+            "end_offset",
+            "start_batch_num",
+            "batch_num",
+        ]
+        expected = {
+            "job_id": task_data.get("job_id"),
+            "dataset_url": task_data.get("dataset_url", ""),
+            "dataset_type": task_data.get("dataset_type", "csv"),
+            "batch_size": int(task_data.get("batch_size", 0) or 0),
+            "model_name": task_data.get("model_name", ""),
+            "encoder_name": task_data.get("encoder_name", ""),
+            "start_offset": int(task_data.get("start_offset", 0) or 0),
+            "end_offset": int(task_data.get("end_offset", 0) or 0),
+            "start_batch_num": int(task_data.get("start_batch_num", 0) or 0),
+            "batch_num": int(batch_num),
+        }
+        for f in fields:
+            if meta.get(f) != expected.get(f):
+                return False
+        return True
+
+    def get_batch_data(self, job_id, batch_num):
+        """Load a stored batch (disk-first, memory fallback)."""
+        batch_key = f"{job_id}_batch_{batch_num}"
+        if hasattr(self.participant, "local_batches") and batch_key in self.participant.local_batches:
+            return self.participant.local_batches[batch_key]
+
+        path = self._batch_file_path(job_id, batch_num)
+        if os.path.exists(path):
+            return self._read_gz_json(path)
+        return None
+
+    def _store_batch(self, job_id, batch_num, batch_data):
+        self._ensure_job_dir(job_id)
+        path = self._batch_file_path(job_id, batch_num)
+        self._write_gz_json_atomic(path, batch_data)
+        meta = batch_data.get("_meta", {}) if isinstance(batch_data, dict) else {}
+        if isinstance(meta, dict):
+            did = meta.get("dataset_id")
+            if did:
+                cache_dir = os.path.join(self._cache_root_dir(), str(did))
+                os.makedirs(cache_dir, exist_ok=True)
+                cache_path = self._cache_batch_path(did, batch_num)
+                self._write_gz_json_atomic(cache_path, batch_data)
+        batch_key = f"{job_id}_batch_{batch_num}"
+        if not hasattr(self.participant, "local_batches"):
+            self.participant.local_batches = {}
+        self.participant.local_batches[batch_key] = batch_data
 
     def _start_worker(self):
         if self._worker_thread and self._worker_thread.is_alive():
@@ -58,10 +188,11 @@ class PrepNode:
 
                 task_id, task_data = item
                 try:
-                    # Mark as running for observability
                     self.active_tasks[task_id] = "running"
+                    self._busy_task_id = task_id
                     self._process_task(task_id, task_data)
                 finally:
+                    self._busy_task_id = None
                     self._task_queue.task_done()
             logger.info("PREP worker stopped")
 
@@ -100,6 +231,10 @@ class PrepNode:
             time.sleep(self.poll_interval)
 
     def _poll_for_task(self):
+        if self._busy_task_id is not None:
+            return
+        if not self._task_queue.empty():
+            return
         if not self.participant.ws or not self.participant.connected:
             return
         try:
@@ -157,6 +292,7 @@ class PrepNode:
         batch_size = data.get("batch_size", 32)
         start_offset = data.get("start_offset", 0)
         end_offset = data.get("end_offset", 1000)
+        start_batch_num = int(data.get("start_batch_num", 0) or 0)
         model_name = data.get("model_name", "bert-base-uncased")
         encoder_name = data.get("encoder_name", "bert")
         task_id = data.get("task_id")
@@ -201,18 +337,45 @@ class PrepNode:
             logger.info(f"  Loading encoder: {encoder_name}")
             encoder = self._get_encoder(encoder_name)
             encoder.eval()
-            
+            all_cached = True
+            for i in range(total_batches):
+                bn = start_batch_num + i
+                stored = self.get_batch_data(job_id, bn)
+                if stored is None or (not self._stored_batch_is_compatible(stored, data, bn)):
+                    all_cached = False
+                    break
+            if all_cached and total_batches > 0:
+                logger.info(f"  All {total_batches} batches are already cached on disk. Skipping compute.")
+                for i in range(total_batches):
+                    bn = start_batch_num + i
+                    stored = self.get_batch_data(job_id, bn) or {}
+                    meta = stored.get("_meta", {})
+                    record_count = int(meta.get("record_count", 0) or 0)
+                    progress = (i + 1) / total_batches * 100
+                    self.participant._report_batch_progress(job_id, bn, "ready", progress, record_count)
+                logger.info(f"PREP: Completed preprocessing for job {job_id} (cache hit)")
+                self._poll_for_task()
+                return
+
             for i in range(total_batches):
                 if not self.participant.training_active:
                     logger.info("Preprocessing stopped")
                     break
-
-                batch_num = i
+                batch_num = start_batch_num + i
                 start_idx = i * batch_size
                 end_idx = min(start_idx + batch_size, len(texts))
                 
                 if start_idx >= len(texts):
                     break
+
+                stored = self.get_batch_data(job_id, batch_num)
+                if stored is not None and self._stored_batch_is_compatible(stored, data, batch_num):
+                    meta = stored.get("_meta", {})
+                    record_count = int(meta.get("record_count", 0) or 0)
+                    progress = (i + 1) / total_batches * 100
+                    self.participant._report_batch_progress(job_id, batch_num, "ready", progress, record_count)
+                    logger.info(f"  Batch {batch_num} already cached ({progress:.1f}%), skipping")
+                    continue
                 
                 input_ids_data = encoded["input_ids"]
                 attention_mask_data = encoded["attention_mask"]
@@ -247,12 +410,13 @@ class PrepNode:
                     logger.info(f"  Unique labels in batch: {unique}")
                 
                 stored_data = {
+                    "_meta": self._batch_signature(data, batch_num, end_idx - start_idx),
                     "embeddings": batch_embeddings.cpu().tolist(),
                     "attention_mask": batch_attention_mask.cpu().tolist(),
                     "input_ids": batch_input_ids.cpu().tolist(),
                     "labels": batch_labels,
                 }
-                self._store_batch_locally(batch_key, stored_data)
+                self._store_batch(job_id, batch_num, stored_data)
                 
                 progress = (i + 1) / total_batches * 100
                 self.participant._report_batch_progress(job_id, batch_num, "ready", progress, end_idx - start_idx)
@@ -387,7 +551,7 @@ class PrepNode:
                         success = False
 
             if not success:
-                logger.warning(f"⚠️ Failed to fetch data at offset {current_offset}. Stopping pagination.")
+                logger.warning(f"Failed to fetch data at offset {current_offset}. Stopping pagination.")
                 break
 
             if not rows:
@@ -408,7 +572,7 @@ class PrepNode:
         if not all_rows:
             raise ValueError(f"No data could be loaded from HF dataset '{dataset_path}'. Check name/config/split or network.")
 
-        logger.info(f"✅ Successfully loaded {len(all_rows)} rows from HF API (requested {length})")
+        logger.info(f"Successfully loaded {len(all_rows)} rows from HF API (requested {length})")
         return pd.DataFrame(all_rows)
     
     def _load_huggingface_dataset(self, url, dataset_type, offset=0, length=100):
@@ -474,15 +638,24 @@ class PrepNode:
         return encoder
     
     def _store_batch_locally(self, key, batch_data):
-        if not hasattr(self.participant, 'local_batches'):
-            self.participant.local_batches = {}
-        self.participant.local_batches[key] = batch_data
+        try:
+            parts = str(key).split("_batch_")
+            job_id = parts[0]
+            batch_num = int(parts[1]) if len(parts) > 1 else 0
+        except Exception:
+            job_id = "unknown"
+            batch_num = 0
+        self._store_batch(job_id, batch_num, batch_data)
 
     def handle_task_assigned(self, data):
         task_id = data.get("id")
         task_data = data.get("data")
         logger.info(f"Received assigned task {task_id}")
-        # Single-threaded: enqueue and process sequentially
+        if self._busy_task_id is not None or (not self._task_queue.empty()):
+            logger.warning(f"PREP is busy (current={self._busy_task_id}), rejecting task {task_id}")
+            self._report_task_error(task_id, "busy")
+            return
+
         self.active_tasks[task_id] = "queued"
         self._task_queue.put((task_id, task_data))
 
@@ -492,17 +665,18 @@ class PrepNode:
         request_from = data.get("request_from")
         logger.info(f"Sending batch {batch_num} to {request_from}")
 
-        batch_key = f"{job_id}_batch_{batch_num}"
-        if hasattr(self.participant, 'local_batches') and batch_key in self.participant.local_batches:
-            batch_data = self.participant.local_batches[batch_key]
-            if self.participant.ws and self.participant.connected:
-                self.participant.ws.send(json.dumps({
-                    "type": "batch_data",
-                    "job_id": job_id,
-                    "batch_number": batch_num,
-                    "batch_data": batch_data,
-                    "from": self.participant.name,
-                }))
-                logger.info(f"Sent batch {batch_num} to {request_from}")
-        else:
-            logger.warning(f"Batch {batch_num} not found in local storage")
+        batch_data = self.get_batch_data(job_id, batch_num)
+        if batch_data is None:
+            logger.warning(f"Batch {batch_num} not found (memory/disk)")
+            return
+
+        if self.participant.ws and self.participant.connected:
+            self.participant.ws.send(json.dumps({
+                "type": "batch_data",
+                "job_id": job_id,
+                "batch_number": batch_num,
+                "batch_data": batch_data,
+                "from": self.participant.name,
+                "request_from": request_from,
+            }))
+            logger.info(f"Sent batch {batch_num} to {request_from}")

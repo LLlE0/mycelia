@@ -1,31 +1,25 @@
-```
-# Python
 __pycache__/
+.pytest_cache/
 *.pyc
-*.pyo
-*.pyd
 
-# Logs and temp files
+.venv/
+venv/
+ENV/
+
+data/
+peer/data/
+peer/__pycache__/
+
 *.log
 *.tmp
 *.swp
+*.swo
+bin/
+*.exe
+*.out
+*.test
 
-# Environment
+/p2p-network
+/coordinator/p2p-network
+/coordinator/coordinator
 .env
-.env.local
-*.env.*
-
-# Editors
-.vscode/
-.idea/
-
-# Dependencies
-.venv/
-venv/
-node_modules/
-
-# Build artifacts
-dist/
-build/
-target/
-```

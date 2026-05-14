@@ -1,6 +1,3 @@
-# ML Tasks Module for P2P Network
-# This module provides task handlers for various ML operations
-
 import logging
 import os
 
@@ -75,8 +72,6 @@ def task_keybert_train(participant, data):
             "error": str(e)
         }
 
-
-# Global tokenizer cache
 _tokenizer_cache = {}
 
 
@@ -110,20 +105,14 @@ def task_data_preprocess(participant, data):
         
         os.makedirs(output_path, exist_ok=True)
         
-        # Load data (assuming CSV format)
         if os.path.exists(dataset_path):
             df = pd.read_csv(dataset_path)
         else:
-            # Create sample data for demonstration
-            df = pd.DataFrame({
-                "text": data.get("sample_texts", [
-                    "Machine learning is a subset of artificial intelligence.",
-                    "Deep learning uses neural networks with multiple layers.",
-                    "Natural language processing deals with text data.",
-                    "Computer vision enables machines to see and understand images.",
-                    "Reinforcement learning trains agents through rewards."
-                ])
-            })
+            return {
+            "status": "error",
+            "from": participant.name,
+            "error": str(e)
+            }
         
         processed_count = 0
         
@@ -143,17 +132,14 @@ def task_data_preprocess(participant, data):
                 processed_count = len(df)
                             
         elif preprocessing_type == "normalize":
-            # Simple normalization
             df['text_normalized'] = df['text'].str.lower().str.strip()
             processed_count = len(df)
             
         elif preprocessing_type == "augment":
-            # Simple augmentation (add noise)
             import random
             def augment_text(text):
                 words = text.split()
                 if len(words) > 3:
-                    # Randomly duplicate a word
                     idx = random.randint(0, len(words)-1)
                     words.insert(idx, words[idx])
                 return ' '.join(words)
@@ -161,7 +147,6 @@ def task_data_preprocess(participant, data):
             df['text_augmented'] = df['text'].apply(augment_text)
             processed_count = len(df)
         
-        # Save processed data
         output_file = os.path.join(output_path, "processed.parquet")
         df.to_parquet(output_file)
         
@@ -204,20 +189,16 @@ def task_model_train(participant, data):
         
         logger.info(f"Training {model_type} model for {epochs} epochs")
         
-        # For demonstration, use simple synthetic data
-        # In production, load from dataset_path
         num_samples = 1000
-        input_dim = 768  # BERT hidden size
+        input_dim = 768
         num_classes = 10
         
-        # Create synthetic data
         X = torch.randn(num_samples, input_dim)
         y = torch.randint(0, num_classes, (num_samples,))
         
         dataset = TensorDataset(X, y)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
-        # Simple classifier
         model = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.ReLU(),
@@ -228,7 +209,6 @@ def task_model_train(participant, data):
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
         
-        # Training loop
         total_loss = 0.0
         for epoch in range(epochs):
             epoch_loss = 0.0
@@ -308,13 +288,11 @@ def task_aggregate_weights(participant, data):
                             if isinstance(aggregated[key], torch.Tensor):
                                 aggregated[key] += weights[key]
             
-            # Average
             if aggregated:
                 for key in aggregated.keys():
                     if isinstance(aggregated[key], torch.Tensor):
                         aggregated[key] = aggregated[key] / num_clients
         
-        # Convert tensors to lists for JSON serialization
         result_weights = {}
         for key, value in aggregated.items():
             if isinstance(value, torch.Tensor):
@@ -349,22 +327,9 @@ def task_validate_model(participant, data):
     - dataset_path: path to validation data
     - metrics: list of metrics to compute
     """
-    try:
-        import torch
-        
-        model_path = data.get("model_path")
-        metrics = data.get("metrics", ["accuracy", "f1"])
-        
-        logger.info(f"Validating model: {model_path}")
-        
-        # For demonstration, return mock results
-        results = {
-            "accuracy": 0.85,
-            "f1_score": 0.82,
-            "precision": 0.84,
-            "recall": 0.83
-        }
-        
+
+    #Тут надо валидировать модель
+    try:    
         return {
             "status": "completed",
             "from": participant.name,
@@ -382,7 +347,6 @@ def task_validate_model(participant, data):
         }
 
 
-# Task registry - maps task names to handler functions
 TASK_HANDLERS = {
     "keybert_train": task_keybert_train,
     "data_preprocess": task_data_preprocess,

@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -33,7 +35,6 @@ type Server struct {
 	coordinator *CoordinatorInfo
 	ccThreshold float64
 
-	// Relay server for P2P connection establishment
 	relayServer   *RelayServer
 	relayListener net.Listener
 	relayPort     int
@@ -42,6 +43,12 @@ type Server struct {
 type adminSession struct {
 	Login string `json:"login"`
 	Exp   int64  `json:"exp"`
+}
+
+func datasetID(datasetURL, datasetType, modelName, encoderName string, batchSize int) string {
+	key := fmt.Sprintf("%s|%s|%s|%s|%d", datasetURL, datasetType, modelName, encoderName, batchSize)
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
 }
 
 type CoordinatorInfo struct {
@@ -95,7 +102,6 @@ func (rs *RelayServer) Start(port int) error {
 func (rs *RelayServer) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	// Read session ID from client
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
@@ -109,7 +115,6 @@ func (rs *RelayServer) handleConnection(conn net.Conn) {
 	rs.mu.Lock()
 	session, exists := rs.sessions[sessionID]
 	if !exists {
-		// Create new session
 		session = &RelaySession{
 			id:     sessionID,
 			active: false,
@@ -122,7 +127,6 @@ func (rs *RelayServer) handleConnection(conn net.Conn) {
 		log.Printf("Node A connected to session %s", sessionID)
 		rs.mu.Unlock()
 
-		// Wait for node B
 		for !session.active {
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -157,11 +161,9 @@ func (rs *RelayServer) relayData(src, dst net.Conn) {
 }
 
 func NewServer(db *Database, addr string) *Server {
-	// Get local IP and hostname
 	hostname, _ := os.Hostname()
 	localIP := getLocalIP()
 
-	// Get CC threshold from environment (default 1.0)
 	ccThreshold := 0.71
 	if val := os.Getenv("CC_THRESHOLD"); val != "" {
 		if parsed, err := strconv.ParseFloat(val, 64); err == nil {
@@ -170,10 +172,8 @@ func NewServer(db *Database, addr string) *Server {
 	}
 	log.Printf("CC Threshold: %.2f", ccThreshold)
 
-	// Find available port for coordinator
 	coordinatorPort := findAvailablePort(11130)
 
-	// Initialize relay server
 	relayPort := findAvailablePort(11150)
 	relayServer := NewRelayServer()
 	if err := relayServer.Start(relayPort); err != nil {
@@ -203,15 +203,11 @@ func NewServer(db *Database, addr string) *Server {
 	}
 }
 
-// configurePingHandler sets up ping/pong handlers for the WebSocket connection
-// This ensures connections stay alive during heavy processing
 func configurePingHandler(conn *websocket.Conn) {
-	// Set pong handler - respond to pings automatically
 	conn.SetPongHandler(func(string) error {
 		return nil
 	})
 
-	// Set ping handler - respond to ping with pong
 	conn.SetPingHandler(func(appData string) error {
 		log.Printf("Received ping, sending pong")
 		err := conn.WriteControl(websocket.PongMessage, []byte{}, time.Now().Add(time.Second))
@@ -256,7 +252,6 @@ func getSystemInfo() map[string]interface{} {
 func (s *Server) Start() error {
 	r := gin.Default()
 
-	// Set up template
 	r.SetHTMLTemplate(htmlTemplate)
 
 	// Auth routes
@@ -352,7 +347,6 @@ func (s *Server) setAdminSessionCookie(c *gin.Context, login string) {
 	payload := base64.RawURLEncoding.EncodeToString(raw)
 	sig := s.sign([]byte(payload))
 	value := payload + "." + sig
-	// secure=false by default because deployments vary; can be reversed behind TLS terminator
 	c.SetCookie("admin_session", value, 24*3600, "/", "", false, true)
 }
 
@@ -450,7 +444,6 @@ func (s *Server) handleIndex(c *gin.Context) {
 	participants, _ := s.db.GetParticipants()
 	messages, _ := s.db.GetMessages()
 
-	// Include coordinator in the list
 	allMembers := append([]Participant{{
 		Name:    s.coordinator.Name,
 		Address: s.coordinator.Address,
@@ -503,7 +496,6 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 	}
 	defer conn.Close()
 
-	// Configure ping/pong handlers to keep connection alive during heavy processing
 	configurePingHandler(conn)
 
 	s.clientsMu.Lock()
@@ -511,14 +503,11 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 	s.clientsMu.Unlock()
 
 	log.Printf("Client %s connected via WebSocket", name)
-
-	// Get participant info from database to send role
 	p, err := s.db.GetParticipantByName(name)
 	var role string
 	if err == nil {
 		role = p.Role
 		log.Printf("Sending role %s to client %s", role, name)
-		// Send role assignment immediately after connection
 		conn.WriteJSON(gin.H{
 			"type": "role_assigned",
 			"role": role,
@@ -526,7 +515,6 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 	}
 	participants, _ := s.db.GetParticipants()
 
-	// Build combined list with coordinator
 	allParticipants := make([]map[string]interface{}, 0)
 	allParticipants = append(allParticipants, map[string]interface{}{
 		"name":    s.coordinator.Name,
@@ -562,7 +550,6 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 		msgType, _ := msgData["type"].(string)
 
 		if msgType == "get_participants" {
-			// Send updated participant list
 			participants, _ := s.db.GetParticipants()
 			allParticipants := make([]map[string]interface{}, 0)
 			allParticipants = append(allParticipants, map[string]interface{}{
@@ -574,7 +561,6 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 				"online":  true,
 			})
 			for _, p := range participants {
-				// Check if participant is connected via WebSocket
 				s.clientsMu.RLock()
 				_, online := s.clients[p.Name]
 				s.clientsMu.RUnlock()
@@ -588,7 +574,6 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 					"online":  online,
 				})
 			}
-			// Send as JSON object instead of string
 			conn.WriteJSON(gin.H{"type": "participants_list", "participants": allParticipants})
 		} else if msgType == "ping" {
 			target, _ := msgData["target"].(string)
@@ -646,6 +631,11 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 			role, _ := msgData["role"].(string)
 			log.Printf("Poll from %s (role: %s)", from, role)
 			if role == "PREP" || role == "PROC" {
+				assigned, err := s.db.GetAssignedPendingTasks(role, from)
+				if err == nil && len(assigned) > 0 {
+					conn.WriteJSON(gin.H{"type": "poll_ack", "from": s.coordinator.Name})
+					continue
+				}
 				tasks, err := s.db.GetPendingTasksByRole(role)
 				if err != nil {
 					log.Printf("Poll error: %v", err)
@@ -682,10 +672,7 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 				conn.WriteJSON(gin.H{"type": "poll_ack", "from": s.coordinator.Name})
 			}
 		} else if msgType == "batch_progress" {
-			// Handle batch progress from PREP nodes
 			jobID, _ := msgData["job_id"].(string)
-
-			// Handle batch_number - could be string or number
 			batchNum := 0
 			if batchNumStr, ok := msgData["batch_number"].(string); ok {
 				if n, err := strconv.Atoi(batchNumStr); err == nil {
@@ -698,7 +685,6 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 			status, _ := msgData["status"].(string)
 			from, _ := msgData["from"].(string)
 
-			// Extract record_count and progress if present
 			recordCount := 0
 			if rc, ok := msgData["record_count"].(float64); ok {
 				recordCount = int(rc)
@@ -710,8 +696,6 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 
 			log.Printf("Batch progress from %s: job=%s, batch=%d, status=%s, records=%d, progress=%.1f",
 				from, jobID, batchNum, status, recordCount, progress)
-
-			// Update batch in database
 			batch := &Batch{
 				JobID:       jobID,
 				BatchNumber: batchNum,
@@ -721,8 +705,6 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 				Progress:    progress,
 			}
 			s.db.SaveBatch(batch)
-
-			// Update training job progress
 			job, err := s.db.GetTrainingJobByID(jobID)
 			if err == nil {
 				ready := 0
@@ -732,7 +714,6 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 						ready++
 					}
 				}
-				// Calculate actual total batches based on dataset size and batch size (ceiling division)
 				actualTotalBatches := job.TotalBatches
 				if job.DatasetSize > 0 && job.BatchSize > 0 {
 					actualTotalBatches = (job.DatasetSize + job.BatchSize - 1) / job.BatchSize
@@ -740,14 +721,12 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 				prepProgress := float64(ready) / float64(actualTotalBatches) * 100
 				s.db.UpdateTrainingJob(jobID, bson.M{"progress": prepProgress})
 
-				// Check if all batches ready - start training
-				if ready >= actualTotalBatches-31 && job.Status == "preprocessing" {
-					log.Printf("All %d batches ready (%.1f%%), starting training round for job %s", ready, prepProgress, jobID)
+				if ready >= actualTotalBatches && job.Status == "preprocessing" {
+					log.Printf("All %d/%d batches ready (%.1f%%), starting training round for job %s", ready, actualTotalBatches, prepProgress, jobID)
 					s.startTrainingRound(jobID)
 				}
 			}
 		} else if msgType == "request_batch" {
-			// Handle batch request from PROC node - forward to PREP node
 			targetPeer, _ := msgData["target_peer"].(string)
 			jobID, _ := msgData["job_id"].(string)
 			batchNum := 0
@@ -762,7 +741,6 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 			from, _ := msgData["from"].(string)
 			log.Printf("Batch request from %s for batch %d from %s", from, batchNum, targetPeer)
 
-			// Forward request to PREP node
 			s.forwardToClient(targetPeer, gin.H{
 				"type":         "send_batch",
 				"job_id":       jobID,
@@ -770,14 +748,12 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 				"request_from": from,
 			})
 		} else if msgType == "task_error" {
-			// Handle task error from PREP/PROC nodes
 			taskID, _ := msgData["task_id"].(string)
 			from, _ := msgData["from"].(string)
 			errorMsg, _ := msgData["error"].(string)
 
 			log.Printf("Task %s failed by %s: %s", taskID, from, errorMsg)
 
-			// Reset pending task to allow retry by another node
 			pendingTask, err := s.db.GetPendingTaskByID(taskID)
 			if err == nil && pendingTask != nil {
 				retries := pendingTask.Retries + 1
@@ -789,26 +765,62 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 					s.db.UpdatePendingTask(taskID, bson.M{"status": "failed", "retries": retries})
 					log.Printf("Task %s exceeded max retries (%d), marked as failed permanently", taskID, maxRetries)
 				} else {
-					s.db.UpdatePendingTask(taskID, bson.M{"status": "pending", "assigned_to": "", "retries": retries})
+					update := bson.M{"status": "pending", "assigned_to": "", "retries": retries}
+					if strings.TrimSpace(strings.ToLower(errorMsg)) == "busy" {
+						update["cooldown_until"] = time.Now().Add(30 * time.Second).Unix()
+					} else {
+						update["cooldown_until"] = int64(0)
+					}
+					s.db.UpdatePendingTask(taskID, update)
 					log.Printf("Task %s failed by %s, reset to pending (retry %d/%d)", taskID, from, retries, maxRetries)
 				}
 			} else {
 				log.Printf("Could not find pending task %s to update on error: %v", taskID, err)
 			}
 
-			// Also update preprocessing task status if it exists
 			err = s.db.UpdatePreprocessingTaskByTaskID(taskID, bson.M{"status": "failed"})
 			if err != nil {
 				log.Printf("Failed to update preprocessing task %s: %v", taskID, err)
 			}
 
 		} else if msgType == "batch_data" {
-			// Handle batch data from PREP node - forward to requesting PROC node
 			requestFrom, _ := msgData["request_from"].(string)
 			if requestFrom != "" {
-				// Forward the batch data to the requesting PROC node
 				s.forwardToClient(requestFrom, msgData)
 				log.Printf("Forwarded batch data to %s", requestFrom)
+			}
+		} else if msgType == "model_update" {
+			from, _ := msgData["from"].(string)
+			jobID, _ := msgData["job_id"].(string)
+			roundNum := 0
+			if r, ok := msgData["round"].(float64); ok {
+				roundNum = int(r)
+			} else if rs, ok := msgData["round"].(string); ok {
+				if n, err := strconv.Atoi(rs); err == nil {
+					roundNum = n
+				}
+			}
+			loss := 0.0
+			if l, ok := msgData["loss"].(float64); ok {
+				loss = l
+			}
+			weights, _ := msgData["weights"].(map[string]interface{})
+
+			update := &ModelUpdate{
+				JobID:   jobID,
+				Round:   roundNum,
+				From:    from,
+				Status:  "received",
+				Weights: weights,
+				Loss:    loss,
+			}
+			_ = s.db.SaveModelUpdate(update)
+			log.Printf("Received model update (WS) from %s for job %s, round %d, loss %.4f", from, jobID, roundNum, loss)
+
+			updates, _ := s.db.GetModelUpdatesByJobAndRound(jobID, roundNum)
+			procNodes := s.findNodesByRole("PROC")
+			if len(updates) >= len(procNodes) && len(procNodes) > 0 {
+				s.aggregateModelUpdates(jobID, roundNum)
 			}
 		}
 	}
@@ -818,10 +830,8 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 	s.clientsMu.Unlock()
 	log.Printf("Client %s disconnected", name)
 
-	// Check if this participant had an incomplete preprocessing task
 	s.handlePrepNodeDisconnect(name)
 
-	// Delete participant from database on disconnect
 	if err := s.db.DeleteParticipant(name); err != nil {
 		log.Printf("Failed to delete participant %s: %v", name, err)
 	} else {
@@ -830,7 +840,6 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 }
 
 func (s *Server) sendPingRequest(from, target string, conn *websocket.Conn) {
-	// Check if target is coordinator
 	if target == s.coordinator.Name {
 		conn.WriteJSON(gin.H{"type": "pong", "from": s.coordinator.Name, "status": "online"})
 		return
@@ -843,7 +852,6 @@ func (s *Server) sendPingRequest(from, target string, conn *websocket.Conn) {
 	if exists {
 		targetConn.WriteJSON(gin.H{"type": "ping", "from": from})
 	} else {
-		// Try direct connection if not connected to coordinator
 		addr, port, err := s.db.GetParticipantAddress(target)
 		if err == nil {
 			go s.directPing(from, addr, port)
@@ -865,18 +873,15 @@ func (s *Server) directPing(from, address string, port int) {
 }
 
 func (s *Server) forwardMessage(from, target, content string) {
-	// Check if target is coordinator
 	if target == s.coordinator.Name {
 		log.Printf("Message to coordinator from %s: %s", from, content)
 		msg := &Message{From: from, To: target, Content: content}
 		s.db.SaveMessage(msg)
 
-		// Send to sender that it was delivered
 		s.forwardToClient(from, gin.H{"type": "delivered", "content": content})
 		return
 	}
 
-	// Save message to database
 	msg := &Message{From: from, To: target, Content: content}
 	s.db.SaveMessage(msg)
 
@@ -906,7 +911,6 @@ func (s *Server) forwardToClient(name string, data gin.H) {
 	}
 }
 
-// API Handlers
 func (s *Server) handleRegister(c *gin.Context) {
 	var p Participant
 	if err := c.ShouldBindJSON(&p); err != nil {
@@ -918,9 +922,7 @@ func (s *Server) handleRegister(c *gin.Context) {
 		p.Role = "PREP"
 	}
 
-	// Calculate ComputeCredit if system info is provided
 	if p.System != nil {
-		// Log received system info for debugging
 		log.Printf("=== Received System Info from %s ===", p.Name)
 		if gpu, ok := p.System["gpu"].(string); ok {
 			log.Printf("  gpu: %s", gpu)
@@ -937,25 +939,32 @@ func (s *Server) handleRegister(c *gin.Context) {
 		if cuda, ok := p.System["cuda"].(bool); ok {
 			log.Printf("  cuda: %v", cuda)
 		}
+		if cudaAvail, ok := p.System["cuda_available"].(bool); ok {
+			log.Printf("  cuda_available: %v", cudaAvail)
+		}
 		log.Printf("===========================================")
 
 		cc := GetComputeCreditForSystemInfo(p.System)
 		log.Printf("ComputeCredit for %s: %.4f", p.Name, cc)
 
-		// Add ComputeCredit to system info
 		if p.System == nil {
 			p.System = make(map[string]interface{})
 		}
 		p.System["compute_credit"] = cc
 
-		// Determine role based on CC threshold
-		if cc >= s.ccThreshold {
+		cudaEnabled := false
+		if cuda, ok := p.System["cuda"].(bool); ok && cuda {
+			cudaEnabled = true
+		}
+		if cudaAvail, ok := p.System["cuda_available"].(bool); ok && cudaAvail {
+			cudaEnabled = true
+		}
+		if cudaEnabled {
 			p.Role = "PROC"
 		} else {
 			p.Role = "PREP"
 		}
 
-		// Log detailed CC calculation
 		ccObj := &ComputeCredit{}
 		ccObj.Calculate(p.System)
 		log.Printf("=== CC Calculation for %s ===", p.Name)
@@ -963,7 +972,7 @@ func (s *Server) handleRegister(c *gin.Context) {
 		log.Printf("  S(cpu) = %.4f (Cores=%d, Clock=%.0fMHz)", ccObj.S_CPU, ccObj.CPUInfo.Cores, ccObj.CPUInfo.ClockMHz)
 		log.Printf("  S(vram) = %.4f (VRAM=%.2fGB)", ccObj.S_VRAM, ccObj.VRAMGB)
 		log.Printf("  CUDA = %v", ccObj.CUDAEnabled)
-		log.Printf("  CC = %.4f (threshold=%.2f) -> Role: %s", cc, s.ccThreshold, p.Role)
+		log.Printf("  CC = %.4f (threshold=%.2f) -> Role: %s (cuda_enabled=%v)", cc, s.ccThreshold, p.Role, cudaEnabled)
 	}
 
 	if err := s.db.AddParticipant(&p); err != nil {
@@ -984,7 +993,6 @@ func (s *Server) handleUpdateParticipant(c *gin.Context) {
 	name := data["name"].(string)
 	port := int(data["port"].(float64))
 
-	// Update participant's batch server port
 	s.db.UpdateParticipant(name, bson.M{"port": port})
 
 	log.Printf("Updated participant %s: batch_port=%d", name, port)
@@ -998,7 +1006,6 @@ func (s *Server) handleAPIParticipants(c *gin.Context) {
 		return
 	}
 
-	// Include coordinator
 	all := append([]Participant{{
 		Name:    s.coordinator.Name,
 		Address: s.coordinator.Address,
@@ -1013,7 +1020,6 @@ func (s *Server) handleAPIParticipants(c *gin.Context) {
 func (s *Server) handleAPIGetParticipant(c *gin.Context) {
 	name := c.Param("name")
 
-	// Check if it's coordinator
 	if name == s.coordinator.Name {
 		c.JSON(http.StatusOK, s.coordinator)
 		return
@@ -1058,7 +1064,6 @@ func (s *Server) handleAPISendMessage(c *gin.Context) {
 func (s *Server) handleAPIPing(c *gin.Context) {
 	name := c.Param("name")
 
-	// Check if it's coordinator
 	if name == s.coordinator.Name {
 		c.JSON(http.StatusOK, gin.H{"status": "online"})
 		return
@@ -1100,7 +1105,6 @@ func (s *Server) handleCommand(c *gin.Context) {
 	}
 
 	if cmd.Type == "send" {
-		// Send from coordinator
 		s.forwardMessage(s.coordinator.Name, cmd.Target, cmd.Content)
 		c.JSON(http.StatusOK, gin.H{"message": "sent from coordinator"})
 	} else if cmd.Type == "ping" {
@@ -1127,7 +1131,6 @@ func toJSON(v interface{}) string {
 	return string(b)
 }
 
-// Task API Handlers
 
 func (s *Server) handleCreateTask(c *gin.Context) {
 	var task Task
@@ -1147,7 +1150,6 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 
 	log.Printf("Task created: %s (type: %s)", task.Name, task.Type)
 
-	// Assign task to available participant
 	s.assignTaskToParticipant(&task)
 
 	c.JSON(http.StatusOK, gin.H{"message": "task created", "task": task})
@@ -1183,7 +1185,6 @@ func (s *Server) handleUpdateTaskStatus(c *gin.Context) {
 		return
 	}
 
-	// Get current task to check loss threshold
 	task, err := s.db.GetTaskByID(id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
@@ -1203,10 +1204,8 @@ func (s *Server) handleUpdateTaskStatus(c *gin.Context) {
 		return
 	}
 
-	// Check if training should stop based on loss threshold
 	if update.Status == "completed" && task.Threshold > 0 && update.Loss < task.Threshold {
 		log.Printf("Task %s completed - loss %.4f below threshold %.4f", id, update.Loss, task.Threshold)
-		// Could notify all participants to stop
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "status updated"})
@@ -1235,7 +1234,6 @@ func (s *Server) handleKeyBERTTask(c *gin.Context) {
 		return
 	}
 
-	// Set defaults
 	if req.ModelName == "" {
 		req.ModelName = "paraphrase-multilingual-MiniLM-L12-v2"
 	}
@@ -1245,8 +1243,6 @@ func (s *Server) handleKeyBERTTask(c *gin.Context) {
 	if req.MinDF == 0 {
 		req.MinDF = 1
 	}
-
-	// Create a task in the database
 	task := &Task{
 		Name:      "keybert-extraction",
 		Type:      "keybert",
@@ -1265,7 +1261,6 @@ func (s *Server) handleKeyBERTTask(c *gin.Context) {
 		return
 	}
 
-	// Find a PROC node to assign the task
 	procNode := s.findPROCNode()
 	if procNode == "" {
 		c.JSON(http.StatusOK, gin.H{
@@ -1276,7 +1271,6 @@ func (s *Server) handleKeyBERTTask(c *gin.Context) {
 		return
 	}
 
-	// Send task to PROC node via WebSocket
 	taskMsg := gin.H{
 		"type":         "task_keybert",
 		"task_id":      task.ID.Hex(),
@@ -1289,7 +1283,6 @@ func (s *Server) handleKeyBERTTask(c *gin.Context) {
 
 	s.forwardToClient(procNode, taskMsg)
 
-	// Update task status
 	now := time.Now()
 	s.db.UpdateTaskStatus(task.ID.Hex(), "running", map[string]interface{}{
 		"assigned_to": procNode,
@@ -1311,16 +1304,14 @@ func (s *Server) findPROCNode() string {
 	defer s.clientsMu.RUnlock()
 
 	for name, conn := range s.clients {
-		// Check if this is a PROC node
 		p, err := s.db.GetParticipantByName(name)
 		if err == nil && p.Role == "PROC" {
 			log.Printf("Found PROC node: %s", name)
 			return name
 		}
-		_ = conn // suppress unused warning
+		_ = conn
 	}
 
-	// If no PROC node connected via WS, try database
 	participants, _ := s.db.GetParticipants()
 	for _, p := range participants {
 		if p.Role == "PROC" && p.Status == "online" {
@@ -1332,7 +1323,6 @@ func (s *Server) findPROCNode() string {
 }
 
 func (s *Server) assignTaskToParticipant(task *Task) {
-	// Find appropriate node based on task type
 	var targetRole string
 	switch task.Type {
 	case "keybert", "train", "model_train":
@@ -1349,7 +1339,6 @@ func (s *Server) assignTaskToParticipant(task *Task) {
 		return
 	}
 
-	// Send task via WebSocket
 	taskMsg := gin.H{
 		"type":       "task_custom",
 		"task_name":  task.Type,
@@ -1377,7 +1366,6 @@ func (s *Server) findNodeByRole(role string) string {
 		}
 	}
 
-	// Fallback to database
 	participants, _ := s.db.GetParticipants()
 	for _, p := range participants {
 		if p.Role == role && p.Status == "online" {
@@ -1388,7 +1376,6 @@ func (s *Server) findNodeByRole(role string) string {
 	return ""
 }
 
-// Handle task results from participants
 func (s *Server) handleTaskResult(c *gin.Context) {
 	var result struct {
 		TaskID     string                 `json:"task_id"`
@@ -1403,7 +1390,6 @@ func (s *Server) handleTaskResult(c *gin.Context) {
 		return
 	}
 
-	// Update task in database
 	output := result.ResultData
 	if result.Loss > 0 {
 		output["loss"] = result.Loss
@@ -1419,7 +1405,6 @@ func (s *Server) handleTaskResult(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "result received"})
 }
 
-// Training Job API Handlers
 
 func (s *Server) handleCreateTrainingJob(c *gin.Context) {
 	var job TrainingJob
@@ -1428,7 +1413,6 @@ func (s *Server) handleCreateTrainingJob(c *gin.Context) {
 		return
 	}
 
-	// Set defaults
 	if job.BatchSize == 0 {
 		job.BatchSize = 32
 	}
@@ -1442,16 +1426,16 @@ func (s *Server) handleCreateTrainingJob(c *gin.Context) {
 		job.MaxRounds = 5
 	}
 	if job.TotalBatches == 0 {
-		job.TotalBatches = 100 // default
+		job.TotalBatches = 100
 	}
 	if job.DatasetSize == 0 {
-		job.DatasetSize = 50000 // default dataset size
+		job.DatasetSize = 50000
 	}
 	if job.ModelName == "" {
-		job.ModelName = "bert-base-uncased" // default model for training
+		job.ModelName = "bert-base-uncased"
 	}
 	if job.ModelType == "" {
-		job.ModelType = "bert" // default model type
+		job.ModelType = "bert" 
 	}
 
 	job.Status = "pending"
@@ -1463,14 +1447,12 @@ func (s *Server) handleCreateTrainingJob(c *gin.Context) {
 
 	log.Printf("Training job created: %s (model: %s, dataset: %s)", job.Name, job.ModelType, job.DatasetURL)
 
-	// Auto-start the training job
 	log.Printf("Auto-starting training job %s...", job.ID.Hex())
 	s.startTrainingJob(job.ID.Hex())
 
 	c.JSON(http.StatusOK, gin.H{"message": "training job created", "job": job})
 }
 
-// startTrainingJob is the internal function that starts a training job
 func (s *Server) startTrainingJob(id string) {
 	job, err := s.db.GetTrainingJobByID(id)
 	if err != nil {
@@ -1478,7 +1460,6 @@ func (s *Server) startTrainingJob(id string) {
 		return
 	}
 
-	// Find PREP nodes to preprocess data
 	prepNodes := s.findNodesByRole("PREP")
 	log.Printf("startTrainingJob: found %d PREP nodes: %v", len(prepNodes), prepNodes)
 
@@ -1489,60 +1470,160 @@ func (s *Server) startTrainingJob(id string) {
 		return
 	}
 
-	// Start preprocessing phase
 	s.db.UpdateTrainingJob(id, bson.M{"status": "preprocessing", "current_round": 0})
 
-	// Create preprocessing subtasks divided by 1000 rows each
-	// Use actual DatasetSize, not TotalBatches * BatchSize (which may be larger due to ceiling)
-	dataset_size := job.DatasetSize
-	if dataset_size == 0 {
-		dataset_size = job.TotalBatches * job.BatchSize
+	datasetSize := job.DatasetSize
+	if datasetSize == 0 {
+		datasetSize = job.TotalBatches * job.BatchSize
 	}
-	subtask_size := 1000
-	num_subtasks := (dataset_size + subtask_size - 1) / subtask_size
-	log.Printf("Creating %d subtasks for dataset size %d (total_batches=%d, batch_size=%d)", num_subtasks, dataset_size, job.TotalBatches, job.BatchSize)
-	for i := 0; i < num_subtasks; i++ {
-		start_offset := i * subtask_size
-		end_offset := start_offset + subtask_size
-		if end_offset > dataset_size {
-			end_offset = dataset_size
-		}
-		start_batch_num := start_offset / job.BatchSize
 
-		// Save pending task to database for polling
-		pendingTask := &PendingTask{
-			JobID:      id,
-			JobName:    job.Name,
-			TaskType:   "preprocess",
-			Role:       "PREP",
-			Status:     "pending",
-			MaxRetries: 3,
-			Data: map[string]interface{}{
-				"job_id":          id,
-				"dataset_url":     job.DatasetURL,
-				"dataset_type":    job.DatasetType,
-				"batch_size":      job.BatchSize,
-				"start_offset":    start_offset,
-				"end_offset":      end_offset,
-				"start_batch_num": start_batch_num,
-				"model_type":      job.ModelType,
-				"model_name":      job.ModelName,
-			},
+	batchSize := job.BatchSize
+	if batchSize <= 0 {
+		batchSize = 32
+	}
+
+	totalBatches := job.TotalBatches
+	if datasetSize > 0 {
+		totalBatches = (datasetSize + batchSize - 1) / batchSize
+	}
+	if totalBatches <= 0 {
+		totalBatches = 1
+	}
+
+	encoderName := job.ModelType
+	if encoderName == "" {
+		encoderName = "bert"
+	}
+	did := datasetID(job.DatasetURL, job.DatasetType, job.ModelName, encoderName, batchSize)
+
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	hasCached := func(nodeName string, batchNum int) bool {
+		p, err := s.db.GetParticipantByName(nodeName)
+		if err != nil || p == nil || p.Address == "" || p.Port == 0 {
+			return false
 		}
-		err = s.db.SavePendingTask(pendingTask)
+		req, _ := http.NewRequest("POST", fmt.Sprintf("http://%s:%d/health", p.Address, p.Port), nil)
+		resp, err := httpClient.Do(req)
 		if err != nil {
-			log.Printf("Failed to save pending task: %v", err)
-		} else {
-			log.Printf("Saved pending subtask %d: records %d-%d", i, start_offset, end_offset)
+			return false
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return false
+		}
+		url := fmt.Sprintf("http://%s:%d/cache/%s/%d", p.Address, p.Port, did, batchNum)
+		r2, err := httpClient.Get(url)
+		if err != nil {
+			return false
+		}
+		_ = r2.Body.Close()
+		return r2.StatusCode == 200
+	}
+
+	missing := make([]int, 0, totalBatches)
+	reused := 0
+	for bn := 0; bn < totalBatches; bn++ {
+		cb, err := s.db.GetCachedBatch(did, bn)
+		if err != nil || cb == nil || cb.StoredOn == "" {
+			missing = append(missing, bn)
+			continue
+		}
+		if !hasCached(cb.StoredOn, bn) {
+			missing = append(missing, bn)
+			continue
+		}
+
+		_ = s.db.UpsertJobBatch(id, bn, bson.M{
+			"job_id":        id,
+			"batch_number":  bn,
+			"status":        "ready",
+			"stored_on":     cb.StoredOn,
+			"record_count":  cb.RecordCount,
+			"progress":      100.0,
+			"created_at":    time.Now(),
+		})
+		reused++
+	}
+	log.Printf("Cache reuse: %d/%d batches reused for job %s (dataset_id=%s)", reused, totalBatches, id, did)
+
+	batchesPerTask := 32
+	if len(missing) == 0 {
+		log.Printf("All batches already available from cache; no preprocessing tasks needed for job %s", id)
+		s.db.UpdateTrainingJob(id, bson.M{"progress": 100.0})
+		s.startTrainingRound(id)
+		return
+	}
+
+	type rng struct{ start, end int }
+	ranges := make([]rng, 0)
+	start := missing[0]
+	prev := missing[0]
+	for i := 1; i < len(missing); i++ {
+		if missing[i] == prev+1 {
+			prev = missing[i]
+			continue
+		}
+		ranges = append(ranges, rng{start: start, end: prev + 1})
+		start = missing[i]
+		prev = missing[i]
+	}
+	ranges = append(ranges, rng{start: start, end: prev + 1})
+
+	numSubtasks := 0
+	for _, r := range ranges {
+		numSubtasks += (r.end - r.start + batchesPerTask - 1) / batchesPerTask
+	}
+	log.Printf("Creating %d preprocess subtasks (total_batches=%d, batch_size=%d, dataset_size=%d, %d batches/task)",
+		numSubtasks, totalBatches, batchSize, datasetSize, batchesPerTask)
+
+	subIdx := 0
+	for _, rr := range ranges {
+		for startBatch := rr.start; startBatch < rr.end; startBatch += batchesPerTask {
+			endBatch := startBatch + batchesPerTask
+			if endBatch > rr.end {
+				endBatch = rr.end
+			}
+
+			startOffset := startBatch * batchSize
+			endOffset := endBatch * batchSize
+			if endOffset > datasetSize {
+				endOffset = datasetSize
+			}
+
+			pendingTask := &PendingTask{
+				JobID:      id,
+				JobName:    job.Name,
+				TaskType:   "preprocess",
+				Role:       "PREP",
+				Status:     "pending",
+				MaxRetries: 3,
+				Data: map[string]interface{}{
+					"job_id":          id,
+					"dataset_url":     job.DatasetURL,
+					"dataset_type":    job.DatasetType,
+					"batch_size":      batchSize,
+					"start_offset":    startOffset,
+					"end_offset":      endOffset,
+					"start_batch_num": startBatch,
+					"model_type":      job.ModelType,
+					"model_name":      job.ModelName,
+					"encoder_name":    encoderName,
+				},
+			}
+			err = s.db.SavePendingTask(pendingTask)
+			if err != nil {
+				log.Printf("Failed to save pending task: %v", err)
+			} else {
+				log.Printf("Saved pending preprocess subtask %d: batches %d-%d (records %d-%d)", subIdx, startBatch, endBatch-1, startOffset, endOffset)
+			}
+			subIdx++
 		}
 	}
 
 	log.Printf("Training job %s started with subtasks created", id)
 }
 
-// handlePrepNodeDisconnect handles the case when a PREP node disconnects mid-task
 func (s *Server) handlePrepNodeDisconnect(nodeName string) {
-	// Find batches that were being processed by this node but not completed
 	pendingBatches, err := s.db.GetBatchesByStatus("pending")
 	if err != nil {
 		log.Printf("Error getting pending batches: %v", err)
@@ -1562,15 +1643,11 @@ func (s *Server) handlePrepNodeDisconnect(nodeName string) {
 
 	log.Printf("PREP node %s disconnected with %d incomplete batches, reassigning...", nodeName, len(incompleteBatches))
 
-	// Get job ID from the first incomplete batch
 	if len(incompleteBatches) > 0 {
 		jobID := incompleteBatches[0].JobID
-
-		// Get available PREP nodes
 		prepNodes, err := s.db.GetParticipantsByRole("PREP")
 		if err != nil || len(prepNodes) == 0 {
 			log.Printf("No available PREP nodes to reassign batches")
-			// Mark batches as failed so job can be retried
 			for _, batch := range incompleteBatches {
 				s.db.SaveBatch(&Batch{
 					JobID:       batch.JobID,
@@ -1581,8 +1658,6 @@ func (s *Server) handlePrepNodeDisconnect(nodeName string) {
 			}
 			return
 		}
-
-		// Find a new PREP node (different from the disconnected one)
 		var newNode string
 		for _, node := range prepNodes {
 			if node.Name != nodeName {
@@ -1596,14 +1671,12 @@ func (s *Server) handlePrepNodeDisconnect(nodeName string) {
 			return
 		}
 
-		// Calculate new batch range for the new node
 		job, err := s.db.GetTrainingJobByID(jobID)
 		if err != nil {
 			log.Printf("Error getting job: %v", err)
 			return
 		}
 
-		// Find the highest batch number already assigned
 		allBatches, _ := s.db.GetBatchesByJob(jobID)
 		maxBatch := 0
 		for _, b := range allBatches {
@@ -1612,20 +1685,17 @@ func (s *Server) handlePrepNodeDisconnect(nodeName string) {
 			}
 		}
 
-		// Assign remaining batches to new node
 		startBatch := maxBatch + 1
 		endBatch := startBatch + len(incompleteBatches)
 		if endBatch > job.TotalBatches {
 			endBatch = job.TotalBatches
 		}
 
-		// Get job details
 		newJob, _ := s.db.GetTrainingJobByID(jobID)
 		if newJob == nil {
 			return
 		}
 
-		// Send task to new node with correct offset
 		s.forwardToClient(newNode, gin.H{
 			"type":           "task_preprocess",
 			"job_id":         jobID,
@@ -1643,7 +1713,6 @@ func (s *Server) handlePrepNodeDisconnect(nodeName string) {
 		log.Printf("Reassigned batches %d-%d to new PREP node %s", startBatch, endBatch, newNode)
 	}
 
-	// Reset any assigned pending tasks for the disconnected node so other nodes can pick them up
 	assignedTasks, err := s.db.GetAssignedPendingTasks("PREP", nodeName)
 	if err != nil {
 		log.Printf("Error getting assigned pending tasks for %s: %v", nodeName, err)
@@ -1682,8 +1751,6 @@ func (s *Server) handleStartTrainingJob(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "training job not found"})
 		return
 	}
-
-	// Find PREP nodes to preprocess data
 	prepNodes := s.findNodesByRole("PREP")
 	log.Printf("handleStartTrainingJob: found %d PREP nodes: %v", len(prepNodes), prepNodes)
 
@@ -1692,11 +1759,8 @@ func (s *Server) handleStartTrainingJob(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no PREP nodes available"})
 		return
 	}
-
-	// Start preprocessing phase
 	s.db.UpdateTrainingJob(id, bson.M{"status": "preprocessing", "current_round": 0})
 
-	// Create preprocessing tasks split by batch_size
 	batchSize := job.BatchSize
 	totalBatches := job.TotalBatches
 
@@ -1707,10 +1771,8 @@ func (s *Server) handleStartTrainingJob(c *gin.Context) {
 			endOffset = job.DatasetSize
 		}
 
-		// Calculate starting batch number for this task
 		startBatchNum := batchIndex * ((endOffset - startOffset) / batchSize)
 
-		// Create preprocessing task for this batch
 		prepTask := &PreprocessingTask{
 			JobID:         id,
 			TaskID:        fmt.Sprintf("%s-prep-%d", id, batchIndex),
@@ -1745,7 +1807,6 @@ func (s *Server) handleStopTrainingJob(c *gin.Context) {
 		return
 	}
 
-	// Notify all nodes to stop
 	allNodes := s.getAllConnectedNodes()
 	for _, node := range allNodes {
 		s.forwardToClient(node, gin.H{
@@ -1804,12 +1865,10 @@ func (s *Server) handleBatchProgress(c *gin.Context) {
 		return
 	}
 
-	// Check if batch exists
 	batches, _ := s.db.GetBatchesByJob(batch.JobID)
 	found := false
 	for _, b := range batches {
 		if b.BatchNumber == batch.BatchNumber && b.StoredOn == batch.StoredOn {
-			// Update existing batch (including record_count and progress)
 			s.db.UpdateBatch(b.ID.Hex(), bson.M{
 				"status":       batch.Status,
 				"progress":     batch.Progress,
@@ -1821,13 +1880,28 @@ func (s *Server) handleBatchProgress(c *gin.Context) {
 	}
 
 	if !found {
-		// Create new batch record with record_count
 		log.Printf("Creating batch: job=%s, batch=%d, records=%d, progress=%.1f",
 			batch.JobID, batch.BatchNumber, batch.RecordCount, batch.Progress)
 		s.db.SaveBatch(&batch)
 	}
 
-	// Check if all batches are ready
+	if job, err := s.db.GetTrainingJobByID(batch.JobID); err == nil && job != nil {
+		enc := job.ModelType
+		if enc == "" {
+			enc = "bert"
+		}
+		did := datasetID(job.DatasetURL, job.DatasetType, job.ModelName, enc, job.BatchSize)
+		_ = s.db.UpsertCachedBatch(&CachedBatch{
+			DatasetID:   did,
+			DatasetURL:  job.DatasetURL,
+			BatchSize:   job.BatchSize,
+			ModelName:   job.ModelName,
+			EncoderName: enc,
+			BatchNumber: batch.BatchNumber,
+			RecordCount: batch.RecordCount,
+			StoredOn:    batch.StoredOn,
+		})
+	}
 	_, ready, _ := s.db.GetBatchStats(batch.JobID)
 	job, _ := s.db.GetTrainingJobByID(batch.JobID)
 	log.Printf("handleBatchProgress: job=%s, total_batches=%d, ready_batches=%d, status=%s",
@@ -1844,7 +1918,6 @@ func (s *Server) handleBatchProgress(c *gin.Context) {
 		}
 	}
 
-	// Update job progress
 	if job != nil {
 		prepProgress := float64(ready) / float64(job.TotalBatches) * 100
 		log.Printf("Updating job %s progress to %.1f%% (%d/%d batches)", batch.JobID, prepProgress, ready, job.TotalBatches)
@@ -1861,14 +1934,12 @@ func (s *Server) handleModelUpdate(c *gin.Context) {
 		return
 	}
 
-	// Save the model update
 	update.Status = "received"
 	s.db.SaveModelUpdate(&update)
 
 	log.Printf("Received model update from %s for job %s, round %d, loss %.4f",
 		update.From, update.JobID, update.Round, update.Loss)
 
-	// Check if we have all expected updates for this round
 	job, _ := s.db.GetTrainingJobByID(update.JobID)
 	if job == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
@@ -1879,7 +1950,6 @@ func (s *Server) handleModelUpdate(c *gin.Context) {
 	procNodes := s.findNodesByRole("PROC")
 
 	if len(updates) >= len(procNodes) {
-		// All nodes submitted updates - aggregate
 		s.aggregateModelUpdates(update.JobID, update.Round)
 	}
 
@@ -1898,8 +1968,6 @@ func (s *Server) handleGetTrainingRound(c *gin.Context) {
 
 	c.JSON(http.StatusOK, round)
 }
-
-// Helper functions
 
 func (s *Server) findNodesByRole(role string) []string {
 	var nodes []string
@@ -1920,7 +1988,6 @@ func (s *Server) findNodesByRole(role string) []string {
 	}
 	s.clientsMu.RUnlock()
 
-	// Fallback to database
 	if len(nodes) == 0 {
 		log.Printf("No connected nodes with role %s, falling back to database", role)
 		participants, _ := s.db.GetParticipants()
@@ -1956,7 +2023,6 @@ func (s *Server) startTrainingRound(jobID string) {
 
 	log.Printf("=== startTrainingRound called for job %s (status=%s, round=%d) ===", jobID, job.Status, job.CurrentRound)
 
-	// Update job status
 	nextRound := job.CurrentRound + 1
 	s.db.UpdateTrainingJob(jobID, bson.M{
 		"status":        "training",
@@ -1964,7 +2030,6 @@ func (s *Server) startTrainingRound(jobID string) {
 	})
 	log.Printf("Updated job %s status to 'training', round %d", jobID, nextRound)
 
-	// Find PROC nodes
 	procNodes := s.findNodesByRole("PROC")
 	log.Printf("Found %d PROC nodes: %v", len(procNodes), procNodes)
 	if len(procNodes) == 0 {
@@ -1972,7 +2037,6 @@ func (s *Server) startTrainingRound(jobID string) {
 		return
 	}
 
-	// Get ready batches
 	batches, _ := s.db.GetReadyBatches(jobID)
 	log.Printf("Found %d ready batches for job %s", len(batches), jobID)
 	if len(batches) == 0 {
@@ -1980,23 +2044,19 @@ func (s *Server) startTrainingRound(jobID string) {
 		return
 	}
 
-	// Add batch source info - find which PREP node has each batch
-	// Format: batch_number -> {name, ip, port}
 	batchSourceInfo := make(map[string]map[string]string)
 	allBatches, _ := s.db.GetBatchesByJob(jobID)
 	for _, b := range allBatches {
 		if b.Status == "ready" {
-			// Get participant info for IP/port
 			prepNode, _ := s.db.GetParticipantByName(b.StoredOn)
 			batchSourceInfo[strconv.Itoa(b.BatchNumber)] = map[string]string{
 				"name": b.StoredOn,
 				"ip":   prepNode.Address,
-				"port": strconv.Itoa(prepNode.Port), // batch server port
+				"port": strconv.Itoa(prepNode.Port),
 			}
 		}
 	}
 
-	// Send batch source info to all PROC nodes FIRST
 	log.Printf("Sending batch source info to %d PROC nodes", len(procNodes))
 	for _, node := range procNodes {
 		s.forwardToClient(node, gin.H{
@@ -2006,8 +2066,6 @@ func (s *Server) startTrainingRound(jobID string) {
 		})
 		log.Printf("Sent batch_sources to %s with %d batch mappings", node, len(batchSourceInfo))
 	}
-
-	// Distribute batches to PROC nodes
 	batchesPerNode := len(batches) / len(procNodes)
 	for i, node := range procNodes {
 		startIdx := i * batchesPerNode
@@ -2018,7 +2076,6 @@ func (s *Server) startTrainingRound(jobID string) {
 
 		nodeBatches := batches[startIdx:endIdx]
 
-		// Save pending task to database for polling
 		pendingTask := &PendingTask{
 			JobID:    jobID,
 			JobName:  job.Name,
@@ -2055,13 +2112,12 @@ func (s *Server) startTrainingRound(jobID string) {
 			"learning_rate":  job.LearningRate,
 			"batch_size":     job.BatchSize,
 			"threshold":      job.Threshold,
-			"is_first_round": nextRound == 1, // first round starts from scratch
+			"is_first_round": nextRound == 1, 
 		})
 
 		log.Printf("Sent training task to %s (round %d, %d batches)", node, nextRound, len(nodeBatches))
 	}
 
-	// Create training round record
 	round := &TrainingRound{
 		JobID:           jobID,
 		RoundNumber:     nextRound,
@@ -2085,7 +2141,6 @@ func (s *Server) aggregateModelUpdates(jobID string, round int) {
 		return
 	}
 
-	// Calculate average loss and accuracy
 	var totalLoss, totalAccuracy float64
 	for _, u := range updates {
 		totalLoss += u.Loss
@@ -2097,7 +2152,21 @@ func (s *Server) aggregateModelUpdates(jobID string, round int) {
 	log.Printf("Aggregating %d updates for round %d - Avg Loss: %.4f, Avg Accuracy: %.4f",
 		len(updates), round, avgLoss, avgAccuracy)
 
-	// Update round status
+	weightsDir := filepath.Join("coordinator", "data", "weights", jobID)
+	_ = os.MkdirAll(weightsDir, 0o755)
+	inPath := filepath.Join(weightsDir, fmt.Sprintf("round_%d_updates.json", round))
+	outPath := filepath.Join(weightsDir, fmt.Sprintf("round_%d_aggregated.json", round))
+	payload := map[string]interface{}{"job_id": jobID, "round": round, "updates": updates}
+	if b, err := json.Marshal(payload); err == nil {
+		_ = os.WriteFile(inPath, b, 0o644)
+		cmd := exec.Command("python3", filepath.Join("coordinator", "aggregate_weights.py"), "--in", inPath, "--out", outPath)
+		if err := cmd.Run(); err != nil {
+			log.Printf("WARNING: python aggregation failed: %v", err)
+		} else {
+			_ = s.db.UpdateTrainingJob(jobID, bson.M{"model_weights_url": outPath})
+		}
+	}
+
 	roundRec, _ := s.db.GetTrainingRound(jobID, round)
 	if roundRec != nil {
 		s.db.UpdateTrainingRound(roundRec.ID.Hex(), bson.M{
@@ -2108,16 +2177,15 @@ func (s *Server) aggregateModelUpdates(jobID string, round int) {
 		})
 	}
 
-	// Check if training should stop
 	if job.Threshold > 0 && avgLoss < job.Threshold {
 		log.Printf("Training complete! Loss %.4f below threshold %.4f", avgLoss, job.Threshold)
 		s.db.UpdateTrainingJob(jobID, bson.M{
 			"status":       "completed",
 			"current_loss": avgLoss,
 			"progress":     100,
+			"model_weights_url": outPath,
 		})
 
-		// Notify all nodes training is complete
 		allNodes := s.getAllConnectedNodes()
 		for _, node := range allNodes {
 			s.forwardToClient(node, gin.H{
@@ -2129,41 +2197,29 @@ func (s *Server) aggregateModelUpdates(jobID string, round int) {
 		return
 	}
 
-	// Check if more rounds needed
 	if round >= job.MaxRounds {
 		log.Printf("Max rounds %d reached", job.MaxRounds)
 		s.db.UpdateTrainingJob(jobID, bson.M{
 			"status":       "completed",
 			"current_loss": avgLoss,
 			"progress":     100,
+			"model_weights_url": outPath,
 		})
 		return
 	}
-
-	// Start next round
 	s.startTrainingRound(jobID)
 }
 
-// handleSTUN provides STUN-like functionality to help nodes discover their public IP:port
-// This is simplified - in a real STUN scenario, multiple requests from different ports would be used
 func (s *Server) handleSTUN(c *gin.Context) {
-	// Get the requester's IP as seen from the server (may be NAT'd)
 	clientIP := c.ClientIP()
-
-	// Also try to get the actual remote address from the connection
 	forwarded := c.GetHeader("X-Forwarded-For")
 	if forwarded != "" {
 		clientIP = forwarded
 	}
-
-	// Get the port from the request - nodes send their local listening port
 	localPort := c.Query("port")
 
 	log.Printf("STUN request from %s (reported port: %s)", clientIP, localPort)
 
-	// Return the public IP and port information
-	// In a real STUN scenario, the client would use this to determine NAT type
-	// For hole-punching, we return the server's view of the client's IP
 	c.JSON(http.StatusOK, gin.H{
 		"status":        "ok",
 		"external_ip":   clientIP,

@@ -22,6 +22,7 @@ type Database struct {
 	roundCollection             *mongo.Collection
 	preprocessingTaskCollection *mongo.Collection
 	credentialsCollection       *mongo.Collection
+	cachedBatchCollection       *mongo.Collection
 }
 
 func NewDatabase(uri, dbName string) (*Database, error) {
@@ -50,7 +51,41 @@ func NewDatabase(uri, dbName string) (*Database, error) {
 		roundCollection:             db.Collection("training_rounds"),
 		preprocessingTaskCollection: db.Collection("preprocessing_tasks"),
 		credentialsCollection:       db.Collection("credentials"),
+		cachedBatchCollection:       db.Collection("cached_batches"),
 	}, nil
+}
+
+func (d *Database) UpsertCachedBatch(cb *CachedBatch) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cb.UpdatedAt = time.Now()
+	filter := bson.M{"dataset_id": cb.DatasetID, "batch_number": cb.BatchNumber}
+	update := bson.M{"$set": cb}
+	_, err := d.cachedBatchCollection.UpdateOne(ctx, filter, update, options.Update().SetUpsert(true))
+	return err
+}
+
+func (d *Database) GetCachedBatch(datasetID string, batchNumber int) (*CachedBatch, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var cb CachedBatch
+	err := d.cachedBatchCollection.FindOne(ctx, bson.M{"dataset_id": datasetID, "batch_number": batchNumber}).Decode(&cb)
+	if err != nil {
+		return nil, err
+	}
+	return &cb, nil
+}
+
+func (d *Database) UpsertJobBatch(jobID string, batchNumber int, update bson.M) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	filter := bson.M{"job_id": jobID, "batch_number": batchNumber}
+	update["updated_at"] = time.Now()
+	_, err := d.batchCollection.UpdateOne(ctx, filter, bson.M{"$set": update}, options.Update().SetUpsert(true))
+	return err
 }
 
 func (d *Database) GetCredentialByLogin(login string) (*Credential, error) {
@@ -639,7 +674,18 @@ func (d *Database) GetPendingTasksByRole(role string) ([]PendingTask, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	cursor, err := d.pendingTaskCollection.Find(ctx, bson.M{"role": role, "status": "pending"})
+	// If a task is temporarily cooled down (e.g. worker responded "busy"),
+	// do not return it until cooldown_until <= now.
+	now := time.Now().Unix()
+	filter := bson.M{
+		"role":   role,
+		"status": "pending",
+		"$or": []bson.M{
+			{"cooldown_until": bson.M{"$exists": false}},
+			{"cooldown_until": bson.M{"$lte": now}},
+		},
+	}
+	cursor, err := d.pendingTaskCollection.Find(ctx, filter)
 	if err != nil {
 		return nil, err
 	}

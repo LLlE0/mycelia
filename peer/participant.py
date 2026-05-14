@@ -16,7 +16,6 @@ import queue
 import uuid
 import network
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -24,7 +23,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Task registry - add new tasks here
 TASK_REGISTRY = {}
 
 def register_task(task_name):
@@ -38,42 +36,30 @@ def register_task(task_name):
 class Participant:
     def __init__(self, coordinator_url: str, role: str = None, hf_key: str = None):
         self.coordinator_url = coordinator_url.rstrip('/')
-        self.role = role  # PREP or PROC - set by coordinator
+        self.role = role
         self.data_dir = "./data"
         self.name = self._generate_name()
         self.ws = None
         self.connected = False
         self.running = True
-        self.training_active = False  # For federated training
+        self.training_active = False 
         self.hf_key = hf_key or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
-        
-        # Task queue for running heavy ML tasks in separate thread (keeps WebSocket responsive for ping/pong)
         self.task_queue = queue.Queue()
         self.task_worker_running = True
-        self.task_results = {}  # task_id -> result
-        
-        # Tokenizer cache to avoid repeated HuggingFace API calls
-        self.tokenizer_cache = {}  # model_type -> tokenizer
-        
-        # Current training job info
+        self.task_results = {}          
+        self.tokenizer_cache = {}
         self.current_job_id = None
         self.current_round = 0
-        
-        # ML modules - loaded dynamically
         self.ml_module = None
+        self.direct_peers = {}  
+        self.peer_ports = {}  
         
-        # Direct peer connections (for P2P messaging)
-        self.direct_peers = {}  # peer_name -> websocket
-        self.peer_ports = {}    # peer_name -> port for direct connections
-        
-        # System info (without ML libs)
         self.system_info = self._get_system_info()
         from prep import PrepNode
         from proc import ProcNode
         self.prep_node = PrepNode(self)
         self.proc_node = ProcNode(self)
 
-        # Start task worker thread
         self._start_task_worker()
         
     def _generate_name(self) -> str:
@@ -93,8 +79,6 @@ class Participant:
             "disk": self._get_disk(),
             "gpu": self._get_gpu(),
         }
-        
-        # Also add GPU info at top level for easier access
         try:
             gpu_info = json.loads(info["gpu"])
             info["vram_gb"] = gpu_info.get("vram_gb", 0)
@@ -161,13 +145,11 @@ class Participant:
                 if tasks:
                     task = tasks[0]
                     task_data = task.get("data", {})
-                    # Add job_id from task to data (poll response has it at top level)
                     task_data["job_id"] = task.get("job_id")
                     task_data["job_name"] = task.get("job_name")
                     
                     logger.info(f"Received task from poll: {task.get('task_type')} for job {task.get('job_id')}")
                     
-                    # Process the task
                     if task.get("task_type") == "preprocess":
                         self.prep_node.do_preprocess_task(task_data)
                     elif task.get("task_type") == "train":
@@ -226,7 +208,6 @@ class Participant:
         except Exception as e:
                     return 0
         
-        # Fallback to lspci
         try:
             result = subprocess.run(
                 ["bash", "-c", "lspci 2>/dev/null | grep -i vga"],
@@ -258,10 +239,8 @@ class Participant:
         logger.info("PROC role assigned - initializing ML environment...")
         
         try:
-            # Check if torch is already installed
             import torch
             logger.info(f"Torch version: {torch.__version__}")     
-            # Update system info with GPU details
             if torch.cuda.is_available():
                 self.system_info["gpu"] = torch.cuda.get_device_name(0)
                 self.system_info["cuda"] = True
@@ -269,8 +248,6 @@ class Participant:
             else:
                 self.system_info["gpu"] = "CPU only"
                 self.system_info["cuda"] = False
-            
-            # Initialize ML module after torch is loaded
             self._init_ml_module()
             
             return True
@@ -279,7 +256,6 @@ class Participant:
             logger.warning(f"ML libraries not installed: {e}")
             logger.info("Installing ML libraries...")
             
-            # Install required packages
             packages = [
                 "torch>=2.0.0",
                 "transformers>=4.30.0", 
@@ -301,7 +277,6 @@ class Participant:
                 except Exception as e:
                     logger.warning(f"Error installing {pkg}: {e}")
             
-            # Try importing again
             try:
                 import torch
                 if torch.cuda.is_available():
@@ -316,7 +291,6 @@ class Participant:
     def _init_ml_module(self):
         """Initialize ML module after torch is loaded"""
         try:
-            # Import our ML task handlers
             from . import ml_tasks
             self.ml_module = ml_tasks
             logger.info("ML module initialized")
@@ -344,17 +318,13 @@ class Participant:
                     self.role = result['participant'].get('role', 'PREP')
                 logger.info(f"Registered: {self.name}")
                 logger.info(f"Role: {self.role}")
-                
-                # Initialize ML environment if assigned PROC role
                 if self.role == "PROC":
                     self._init_ml_environment()
                 elif self.role == "PREP":
-                    # Start batch server for PREP nodes
                     self.batch_server = network.get_batch_server(self)
                     self.batch_port = self.batch_server.start()
                     logger.info(f"Batch server started on port {self.batch_port}")
                     
-                    # Update coordinator with batch server port
                     try:
                         requests.post(
                             f"{self.coordinator_url}/api/participant/update",
@@ -385,7 +355,6 @@ class Participant:
                 )
                 self.ws.run_forever(ping_interval=30, ping_timeout=10)
             except websocket.WebSocketBadStatusException as e:
-                # Connection rejected (e.g., server not running)
                 logger.error(f"WebSocket connection rejected: {e.status_code}")
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
@@ -398,7 +367,6 @@ class Participant:
         self.connected = True
         logger.info("Connected to coordinator")
 
-        # Poll for tasks on connect
         self._poll_for_tasks()
     
     def _on_ws_message(self, ws, message):
@@ -408,20 +376,24 @@ class Participant:
             
             if msg_type == "role_assigned":
                 new_role = data.get("role")
-                if new_role == "PROC" and self.role != "PROC":
-                    logger.info("Assigned PROC role - initializing ML environment")
-                    self._init_ml_environment()
-
-                    # Start polling for training tasks
+                if new_role == "PROC":
+                    logger.info("Role PROC assigned - ensuring ML env + polling")
+                    if self.ml_module is None:
+                        self._init_ml_environment()
                     self.proc_node.start_polling()
-                elif new_role == "PREP" and self.role != "PREP":
-                    # Start batch server for PREP nodes
-                    logger.info("Assigned PREP role - starting batch server")
+                elif new_role == "PREP":
+                    logger.info("Role PREP assigned - ensuring batch server + polling")
                     self.batch_server = network.get_batch_server(self)
                     self.batch_port = self.batch_server.start()
                     logger.info(f"Batch server running on port {self.batch_port}")
-
-                    # Start polling for preprocessing tasks
+                    try:
+                        requests.post(
+                            f"{self.coordinator_url}/api/participant/update",
+                            json={"name": self.name, "port": self.batch_port},
+                            timeout=5
+                        )
+                    except Exception:
+                        pass
                     self.prep_node.start_polling()
                 self.role = new_role
                 logger.info(f"Role: {self.role}")
@@ -437,7 +409,6 @@ class Participant:
                 task_count = data.get("task_count", 0)
                 if has_tasks:
                     logger.info(f"Coordinator has {task_count} pending tasks - requesting task details")
-                    # Request task details from coordinator
                     self.ws.send(json.dumps({
                         "type": "get_task",
                         "from": self.name,
@@ -447,7 +418,6 @@ class Participant:
                     logger.debug("No pending tasks")
             
             elif msg_type == "task_details":
-                # Received task details from coordinator
                 task = data.get("task", {})
                 task_type = task.get("task_type", "unknown")
                 logger.info(f"Received task: {task_type}")
@@ -474,74 +444,61 @@ class Participant:
                 logger.info(f"{self.role} task: received assigned task")
                 task_id = data.get("id")
                 task_data = data.get("data")
-                # Start task for PREP role only (PROC uses task_train via WebSocket)
                 if self.role == "PREP" and self.prep_node:
                     self.prep_node.handle_task_assigned({"id": task_id, "data": task_data})
-                # PROC tasks are handled via task_train message type
-
+        
             elif msg_type == "task_train":
                 logger.info(f"PROC task: received federated training task via WebSocket")
-                # Queue the training task for processing
                 task_id = str(uuid.uuid4())
-                # Extract task data from the message (remove 'type' field)
-                # job_id might be at top level or inside 'data' field
                 task_data = {k: v for k, v in data.items() if k != 'type'}
-                # Ensure job_id is in task_data (it might be at top level of the message)
                 if "job_id" not in task_data and "job_id" in data:
                     task_data["job_id"] = data["job_id"]
                 self.task_queue.put({"task_id": task_id, "type": "task_train", "data": task_data})
 
             elif msg_type == "send_batch":
-                # Handle batch request from PROC node
-                job_id = data.get("job_id")
-                batch_num = data.get("batch_number")
-                request_from = data.get("request_from")
-                logger.info(f"Sending batch {batch_num} to {request_from}")
-                
-                # Retrieve batch from local storage
-                batch_key = f"{job_id}_batch_{batch_num}"
-                if hasattr(self, 'local_batches') and batch_key in self.local_batches:
-                    batch_data = self.local_batches[batch_key]
-                    # Send batch data to the requesting PROC node
-                    if self.ws and self.connected:
-                        self.ws.send(json.dumps({
-                            "type":          "batch_data",
-                            "job_id":        job_id,
-                            "batch_number":  batch_num,
-                            "batch_data":    batch_data,
-                            "from":          self.name,
-                            "request_from":  request_from,
-                        }))
-                        logger.info(f"Sent batch {batch_num} to {request_from}")
+                if self.role == "PREP" and self.prep_node:
+                    self.prep_node.handle_send_batch(data)
                 else:
-                    logger.warning(f"Batch {batch_num} not found in local storage")
+                    job_id = data.get("job_id")
+                    batch_num = data.get("batch_number")
+                    request_from = data.get("request_from")
+                    logger.info(f"Sending batch {batch_num} to {request_from}")
+                    batch_key = f"{job_id}_batch_{batch_num}"
+                    if hasattr(self, 'local_batches') and batch_key in self.local_batches:
+                        batch_data = self.local_batches[batch_key]
+                        if self.ws and self.connected:
+                            self.ws.send(json.dumps({
+                                "type":          "batch_data",
+                                "job_id":        job_id,
+                                "batch_number":  batch_num,
+                                "batch_data":    batch_data,
+                                "from":          self.name,
+                                "request_from":  request_from,
+                            }))
+                            logger.info(f"Sent batch {batch_num} to {request_from}")
+                    else:
+                        logger.warning(f"Batch {batch_num} not found in local storage")
 
             elif msg_type == "batch_sources":
-                # Store batch source info (which PREP node has which batch)
                 job_id = data.get("job_id")
                 batch_sources = data.get("batch_sources", {})
                 if not hasattr(self, 'batch_sources'):
                     self.batch_sources = {}
                 self.batch_sources[job_id] = batch_sources
                 logger.info(f"Received batch sources for job {job_id}: {len(batch_sources)} batches")
-                # Forward to proc_node for handling
                 if self.role == "PROC" and self.proc_node:
                     self.proc_node.handle_batch_sources(data)
 
             elif msg_type == "batch_data":
-                # Receive batch data from PREP node
                 job_id = data.get("job_id")
                 batch_num = data.get("batch_number")
                 batch_data = data.get("batch_data", {})
                 from_peer = data.get("from")
                 logger.info(f"Received batch {batch_num} from {from_peer}")
-                
-                # Store the batch locally
                 batch_key = f"{job_id}_batch_{batch_num}"
                 if not hasattr(self, 'local_batches'):
                     self.local_batches = {}
                 self.local_batches[batch_key] = batch_data
-                # Forward to proc_node for handling
                 if self.role == "PROC" and self.proc_node:
                     self.proc_node.handle_batch_data(data)
 
@@ -562,20 +519,17 @@ class Participant:
                 self.task_queue.put({"task_id": task_id, "type": "task_keybert", "data": data})
             
             elif msg_type == "task_custom":
-                # Generic task handler - uses task_name to dispatch
                 task_name = data.get("task_name", "unknown")
                 logger.info(f"Custom task: {task_name} (queued)")
                 task_id = str(uuid.uuid4())
                 self.task_queue.put({"task_id": task_id, "type": "task_custom", "data": data})
             
             elif msg_type == "p2p_message":
-                # P2P message from another peer (via coordinator)
                 msg_from = data.get("from", "unknown")
                 content = data.get("content", "")
                 print(f"\n[P2P] From: {msg_from} | Content: {content}\n> ")
             
             elif msg_type == "peer_info":
-                # Response to get_peer_info request
                 peer_name = data.get("peer_name")
                 peer_ip = data.get("ip")
                 peer_port = data.get("port")
@@ -586,24 +540,21 @@ class Participant:
                     print(f"Peer {peer_name} not available for direct connection")
             
             elif msg_type == "participants_list":
-                # Updated participant list
                 participants = data.get("participants", [])
                 print(f"\n{'='*50}")
                 print("PARTICIPANTS:")
                 print(f"{'='*50}")
                 for p in participants:
-                    status = "✓ online" if p.get("online") else "✗ offline"
+                    status = "online" if p.get("online") else "offline"
                     role = p.get("role", "?")
                     print(f"  {p.get('name', '?')} | {role} | {status}")
                 print(f"{'='*50}\n")
             
             elif msg_type == "delivered":
-                # Message delivery confirmation
                 content = data.get("content", "")
                 print(f"[Message delivered] {content[:50]}...")
             
             elif msg_type == "error":
-                # Error message
                 error_msg = data.get("message", "Unknown error")
                 print(f"\n[ERROR] {error_msg}\n> ")
             
@@ -665,9 +616,9 @@ class Participant:
                         self.system_info["gpu"] = torch.cuda.get_device_name(0)
                 except:
                     pass
-                
+                #Только рефреш информации о системе, поллинг по вебсокету!!!
                 self.ws.send(json.dumps({
-                    "type": "poll",
+                    "type": "sysinfo",
                     "from": self.name,
                     "role": self.role or "PREP",
                     "system": self.system_info
@@ -697,6 +648,11 @@ class Participant:
         try:
             if self.prep_node:
                 self.prep_node.stop_worker()
+        except Exception:
+            pass
+        try:
+            if self.proc_node:
+                self.proc_node.stop_worker()
         except Exception:
             pass
         logger.info("Stopped")

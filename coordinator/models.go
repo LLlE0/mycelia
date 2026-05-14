@@ -82,6 +82,23 @@ type Batch struct {
 	UpdatedAt   time.Time          `bson:"updated_at" json:"updated_at"`
 }
 
+// CachedBatch tracks a reusable preprocessed batch across jobs.
+// Collection: cached_batches
+// Key: dataset_id + batch_number
+type CachedBatch struct {
+	ID         primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	DatasetID  string             `bson:"dataset_id" json:"dataset_id"`
+	DatasetURL string             `bson:"dataset_url" json:"dataset_url"`
+	BatchSize  int                `bson:"batch_size" json:"batch_size"`
+	ModelName  string             `bson:"model_name" json:"model_name"`
+	EncoderName string            `bson:"encoder_name" json:"encoder_name"`
+
+	BatchNumber int       `bson:"batch_number" json:"batch_number"`
+	RecordCount int       `bson:"record_count" json:"record_count"`
+	StoredOn    string    `bson:"stored_on" json:"stored_on"`
+	UpdatedAt   time.Time `bson:"updated_at" json:"updated_at"`
+}
+
 // ModelUpdate represents weight deltas from a training node
 type ModelUpdate struct {
 	ID          primitive.ObjectID     `bson:"_id,omitempty" json:"id"`

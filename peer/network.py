@@ -1,8 +1,3 @@
-"""
-P2P Network utilities for direct node-to-node communication
-Handles batch transfer between PREP and PROC nodes without going through coordinator
-"""
-
 import json
 import logging
 import threading
@@ -28,7 +23,6 @@ class BatchServer:
         if self.running:
             return self.port
             
-        # Find available port
         import socket
         for p in range(11130, 11160):
             try:
@@ -55,15 +49,13 @@ class BatchServer:
         return self.port
     
     def _create_handler(self):
-        """Create request handler with access to participant"""
         participant = self.participant
         
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):
-                pass  # Suppress logging
+                pass 
                 
             def do_GET(self):
-                # Parse path: /batch/<job_id>/<batch_number>
                 path = self.path.strip('/')
                 parts = path.split('/')
                 
@@ -78,19 +70,40 @@ class BatchServer:
                     batch_key = f"{job_id}_batch_{batch_num}"
                     local_batches = getattr(participant, 'local_batches', {})
                     
+                    batch_data = None
                     if batch_key in local_batches:
                         batch_data = local_batches[batch_key]
+                    elif getattr(participant, "prep_node", None):
+                        batch_data = participant.prep_node.get_batch_data(job_id, batch_num)
+
+                    if batch_data is not None:
                         self.send_response(200)
                         self.send_header('Content-Type', 'application/json')
                         self.end_headers()
                         self.wfile.write(json.dumps(batch_data).encode())
                     else:
                         self.send_error(404, "Batch not found")
+                elif len(parts) >= 3 and parts[0] == 'cache':
+                    dataset_id = parts[1]
+                    try:
+                        batch_num = int(parts[2])
+                    except:
+                        self.send_error(400, "Invalid batch number")
+                        return
+
+                    if getattr(participant, "prep_node", None):
+                        batch_data = participant.prep_node.get_cached_batch_data(dataset_id, batch_num)
+                        if batch_data is not None:
+                            self.send_response(200)
+                            self.send_header('Content-Type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps(batch_data).encode())
+                            return
+                    self.send_error(404, "Batch not found")
                 else:
                     self.send_error(400, "Invalid request")
                     
             def do_POST(self):
-                # Health check / register endpoint
                 if self.path == '/health':
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -158,8 +171,6 @@ class BatchClient:
         except:
             return None
 
-
-# Global instances
 _batch_server = None
 _batch_client = None
 
